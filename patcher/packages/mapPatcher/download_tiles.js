@@ -4,6 +4,7 @@ import path from 'path';
 import { SphericalMercator } from '@mapbox/sphericalmercator';
 import { VectorTile } from '@mapbox/vector-tile';
 import Pbf from 'pbf';
+import zlib from 'zlib';
 import config from './config.js';
 
 const mercator = new SphericalMercator({size: 256});
@@ -19,13 +20,38 @@ const extractWater = (place) => {
     const xyz = mercator.xyz(place.bbox, 13);
     const features = [];
     
+    let tilesChecked = 0;
+    let layersFound = new Set();
+    
     for (let x = xyz.minX; x <= xyz.maxX; x++) {
         for (let y = xyz.minY; y <= xyz.maxY; y++) {
+            tilesChecked++;
             try {
-                const buffer = execSync(`"${pmtilesPath}" tile "${pmtilesFile}" 13 ${x} ${y} | gzip -d -c`, { stdio: ['ignore', 'pipe', 'ignore'] });
+                // Get tile data from pmtiles
+                let buffer;
+                try {
+                    buffer = execSync(`"${pmtilesPath}" tile "${pmtilesFile}" 13 ${x} ${y}`, { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 10 * 1024 * 1024 });
+                } catch (e) {
+                    // Skip if tile doesn't exist
+                    continue;
+                }
+                
                 if (!buffer.length) continue;
-
-                const tile = new VectorTile(new Pbf(buffer));
+                
+                // Decompress with Node's zlib
+                let decompressed;
+                try {
+                    decompressed = zlib.gunzipSync(buffer);
+                } catch (e) {
+                    // If decompression fails, try using buffer as-is
+                    decompressed = buffer;
+                }
+                
+                const tile = new VectorTile(new Pbf(decompressed));
+                
+                // Collect all layer names
+                Object.keys(tile.layers).forEach(layer => layersFound.add(layer));
+                
                 if (tile.layers.water) {
                     for (let i = 0; i < tile.layers.water.length; i++) {
                         const feature = tile.layers.water.feature(i);

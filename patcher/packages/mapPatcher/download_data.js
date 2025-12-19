@@ -162,16 +162,90 @@ out geom;`
 };
 
 const fetchBuildingsData = async (bbox) => {
-  const buildingQuery = `
+  // Split large bbox into tiles to avoid memory issues
+  const [minLat, minLon, maxLat, maxLon] = bbox;
+  const latDiff = maxLat - minLat;
+  const lonDiff = maxLon - minLon;
+  
+  // Use smaller tiles if area is large (> 0.1 degrees ~11km)
+  const shouldSplit = latDiff > 0.1 || lonDiff > 0.1;
+  
+  if (shouldSplit) {
+    // Split into 4x4 grid (16 tiles)
+    const tilesPerSide = Math.ceil(Math.max(latDiff, lonDiff) / 0.1);
+    const latStep = latDiff / tilesPerSide;
+    const lonStep = lonDiff / tilesPerSide;
+    
+    console.log(`Large area detected! Splitting into ${tilesPerSide}x${tilesPerSide} = ${tilesPerSide * tilesPerSide} tiles...`);
+    
+    let allBuildings = [];
+    let tileCount = 0;
+    const totalTiles = tilesPerSide * tilesPerSide;
+    
+    for (let i = 0; i < tilesPerSide; i++) {
+      for (let j = 0; j < tilesPerSide; j++) {
+        tileCount++;
+        const tileBbox = [
+          minLat + i * latStep,
+          minLon + j * lonStep,
+          minLat + (i + 1) * latStep,
+          minLon + (j + 1) * lonStep
+        ];
+        
+        console.log(`Fetching tile ${tileCount}/${totalTiles} (${tileBbox.join(',')})...`);
+        
+        const buildingQuery = `
+[out:json][timeout:180];
+(
+  way["building"](${tileBbox.join(',')});
+);
+out geom;`;
+        
+        try {
+          const data = await runQuery(buildingQuery);
+          if (data.elements && data.elements.length > 0) {
+            console.log(`  Tile ${tileCount}: ${data.elements.length} buildings`);
+            // Use concat instead of spread to avoid stack overflow with large arrays
+            allBuildings = allBuildings.concat(data.elements);
+          } else {
+            console.log(`  Tile ${tileCount}: 0 buildings`);
+          }
+          
+          // Add delay between requests to be nice to the API
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (err) {
+          console.error(`  Tile ${tileCount} failed:`, err.message);
+          console.log('  Continuing with next tile...');
+        }
+      }
+    }
+    
+    console.log(`Total buildings fetched: ${allBuildings.length}`);
+    return allBuildings;
+  } else {
+    // Small area, fetch directly
+    const buildingQuery = `
 [out:json][timeout:180];
 (
   way["building"](${bbox.join(',')});
 );
-out geom;`
+out geom;`;
 
-  const data = await runQuery(buildingQuery);
+    console.log(`Building query bbox: ${bbox.join(',')}`);
+    console.log('Fetching buildings... (this may take several minutes for large areas)');
+    
+    const data = await runQuery(buildingQuery);
+    
+    console.log(`Buildings returned: ${data.elements ? data.elements.length : 0}`);
+    if (data.elements && data.elements.length > 0) {
+      console.log(`First building sample:`, JSON.stringify(data.elements[0]).substring(0, 200));
+    }
+    if (data.remark) {
+      console.log(`Overpass API remark: ${data.remark}`);
+    }
 
-  return data.elements;
+    return data.elements || [];
+  }
 };
 
 const fetchPlacesData = async (bbox) => {

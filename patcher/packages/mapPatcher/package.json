@@ -15,9 +15,13 @@
     "@mapbox/vector-tile": "^2.0.4",
     "@turf/turf": "^7.3.1",
     "adm-zip": "^0.5.16",
+    "better-sqlite3": "^12.5.0",
     "big-json": "^3.2.0",
     "geojson2svg": "^2.0.3",
+    "pbf": "^4.0.1",
     "piscina": "^5.1.4",
-    "stream-json": "^1.9.1"
+    "pmtiles": "^4.3.0",
+    "stream-json": "^1.9.1",
+    "vt-pbf": "^3.1.3"
   }
 }

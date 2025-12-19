@@ -10,3 +10,8 @@ config.js
 .DS_Store
 SubwayBuilderPatched.app
 premade_maps/*
+output_tiles_test/
+Step
+gzip.exe
+data
+extracted_app/
