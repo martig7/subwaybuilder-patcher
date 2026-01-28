@@ -24,7 +24,18 @@
       "Bash(python:*)",
       "Bash(pip show:*)",
       "Bash(pip install:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(dir /s \"C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\patcher\\\\packages\\\\mapPatcher\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(findstr:*)",
+      "Bash(dir \"C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\SubwayBuilderPatched\\\\resources\\\\app\\\\dist\\\\renderer\\\\public\")",
+      "Bash(ls:*)",
+      "Bash(dir:*)",
+      "Bash(git log:*)",
+      "WebSearch",
+      "Bash(cmd //c install.bat)",
+      "Bash(cmd /c \"cd /d \"\"C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\Japan Pack\\\\com.GCM.OSA_KYO_GEN\"\" && install.bat\")"
     ]
   }
 }

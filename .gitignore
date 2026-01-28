@@ -15,5 +15,6 @@ Step
 gzip.exe
 data
 extracted_app/
-map_tiles/
-processed_data/
+Japan Pack/
+SubwayBuilder-CPH-main/
+bbox_storage.txt
