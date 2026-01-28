@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx @electron/asar:*)",
+      "Bash(node patcher/patch_game.js:*)",
+      "Bash(taskkill:*)",
+      "Bash(cmd /c \"rmdir /s /q \"\"C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\SubwayBuilderPatched\"\"\")",
+      "Bash(tasklist:*)",
+      "Bash(cmd /c \"taskkill /F /PID 31252\")",
+      "Bash(cmd /c \"handle \"\"app.asar\"\" 2>nul\")",
+      "Bash(powershell -Command \"Remove-Item -Path ''C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\SubwayBuilderPatched'' -Recurse -Force -ErrorAction SilentlyContinue; if \\(Test-Path ''C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\SubwayBuilderPatched''\\) { Write-Host ''Still exists'' } else { Write-Host ''Removed'' }\")",
+      "Bash(powershell:*)",
+      "Bash(cmd /c \"del /f /q \"\"C:\\\\Users\\\\darkd\\\\Downloads\\\\subwaybuilder-patcher-gcm\\\\SubwayBuilderPatched\\\\resources\\\\app.asar\"\" 2>&1\")",
+      "Bash(node analyze_clusters.js:*)",
+      "Bash(node process_data.js:*)",
+      "Bash(grep:*)",
+      "Bash(gunzip:*)",
+      "Bash(python3:*)",
+      "Bash(node:*)",
+      "Bash(for city in NYC SF BOS DC)",
+      "Bash(do echo \"=== $city ===\")",
+      "Bash(done)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(npm install:*)"
+    ]
+  }
+}

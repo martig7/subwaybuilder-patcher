@@ -5,3 +5,9 @@ processed_data/*
 map_tiles/*
 !map_tiles/.gitkeep
 config.js
+
+# Worker and temp files
+worker_configs/
+ml_temp/
+ml/__pycache__/
+config.json

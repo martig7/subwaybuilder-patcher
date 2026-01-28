@@ -1,5 +1,47 @@
 import fs from 'fs';
-import config from './config.js';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+// Try to load config from config.json first (for Python optimizer), fallback to config.js
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Support command-line argument for worker-specific config file
+const configFileName = process.argv[2] || 'config.json';
+const configJsonPath = join(__dirname, configFileName);
+
+let config;
+if (fs.existsSync(configJsonPath)) {
+  // Load from config file with retry for parallel execution
+  let retries = 3;
+  let configJson;
+  
+  while (retries > 0) {
+    try {
+      configJson = fs.readFileSync(configJsonPath, 'utf-8');
+      config = JSON.parse(configJson);
+      console.log(`Loaded config from ${configFileName}`);
+      break;
+    } catch (err) {
+      retries--;
+      if (retries === 0) {
+        console.error(`Failed to load ${configFileName} after retries, falling back to config.js`);
+        const configModule = await import('./config.js');
+        config = configModule.default;
+        console.log('Loaded config from config.js');
+      } else {
+        // Wait a bit before retrying (another worker might be writing)
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+  }
+} else {
+  // Fallback to config.js
+  const configModule = await import('./config.js');
+  config = configModule.default;
+  console.log('Loaded config from config.js');
+}
+
 import * as turf from '@turf/turf';
 import { createParseStream } from 'big-json';
 
@@ -11,7 +53,8 @@ const optimizeBuilding = (unOptimizedBuilding) => {
   }
 };
 
-const CS = 0.0009; // This is what the cell size always is in the base game
+// Grid cell size - configurable for testing different resolutions
+const CS = config['grid-cell-size'] || 0.0009; // Default matches base game
 
 const optimizeIndex = (unOptimizedIndex) => {
   return {
@@ -27,8 +70,22 @@ const optimizeIndex = (unOptimizedIndex) => {
   }
 };
 
+// Configurable multipliers for population/job calculations
+const RESIDENTIAL_SQFT_MULTIPLIER = config['residential-sqft-multiplier'] || 1.0;
+const COMMERCIAL_SQFT_MULTIPLIER = config['commercial-sqft-multiplier'] || 1.0;
+const MIXED_USE_RESIDENTIAL_RATIO = config['mixed-use-residential-ratio'] || 0.5; // Base ratio for medium buildings
+const MIXED_USE_THRESHOLD_SMALL = config['mixed-use-threshold-small'] || 5000; // sqft
+const MIXED_USE_THRESHOLD_LARGE = config['mixed-use-threshold-large'] || 20000; // sqft
+
+// Connection generation parameters
+const GRAVITY_EXPONENT = config['gravity-exponent'] || 0.5; // Distance penalty in gravity model
+const MIN_CONNECTIONS_PER_CLUSTER = config['min-connections-per-cluster'] || 5;
+const MAX_CONNECTIONS_PER_CLUSTER = config['max-connections-per-cluster'] || 25;
+const CONNECTION_SIZE_CAP = config['connection-size-cap'] || 200; // Max size before splitting
+const CONNECTION_SCALING_DIVISOR = config['connection-scaling-divisor'] || 40; // sqrt(pop/X) for num connections
+
 // how much square footage we should probably expect per resident of this housing type
-// later on ill calculate the cross section of the building's square footage, 
+// later on ill calculate the cross section of the building's square footage,
 // then multiply that but the total number of floors to get an approximate full square footage number
 // i can then divide by the below number to get a rough populaion stat
 const squareFeetPerPopulation = {
@@ -123,16 +180,18 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
   // Note: We'll merge places AFTER calculating population, so we can protect large neighborhoods
   const totalPlaces = Object.keys(neighborhoods).length;
-  console.log(`Total places before population-aware merging: ${totalPlaces}`);
+  console.log(`Total places from OSM: ${totalPlaces}`);
 
   const centersOfNeighborhoodsFeatureCollection = turf.featureCollection(
     Object.keys(centersOfNeighborhoods).map((placeID) =>
       turf.point(centersOfNeighborhoods[placeID], {
         placeID,
-        name: neighborhoods[placeID].tags.name
+        name: neighborhoods[placeID]?.tags?.name || placeID
       })
     )
   );
+
+  console.log(`Total cluster centers: ${centersOfNeighborhoodsFeatureCollection.features.length}`);
 
   // splitting everything into areas
   const voronoi = turf.voronoi(centersOfNeighborhoodsFeatureCollection, {
@@ -142,18 +201,17 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
   console.log(`Total voronoi features: ${voronoi.features.length}`);
 
   // sorting buildings between residential and commercial
-  // OPTIMIZATION: Filter by area first, avoid creating polygons for tiny buildings
   const buildingTypeCounts = {};
   const residentialCounts = {};
   const commercialCounts = {};
   const mixedUseCounts = {};
   const unclassifiedCounts = {};
-  
+
   rawBuildings.forEach((building) => {
     if (building.tags.building) { // should always be true, but why not
       const buildingType = building.tags.building;
       buildingTypeCounts[buildingType] = (buildingTypeCounts[buildingType] || 0) + 1;
-      
+
       const __coords = building.geometry.map((point) => [point.lon, point.lat]);
       if (__coords.length < 3) return;
       if (__coords[0][0] !== __coords[__coords.length - 1][0] || __coords[0][1] !== __coords[__coords.length - 1][1]) __coords.push(__coords[0]);
@@ -161,38 +219,41 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       let buildingAreaMultiplier = Math.max(Number(building.tags['building:levels']), 1); // assuming a single story if no level data
       if (isNaN(buildingAreaMultiplier)) buildingAreaMultiplier = 1;
       const buildingArea = turf.area(buildingGeometry) * buildingAreaMultiplier * 10.7639; // that magic number converts from square meters to square feet
-      const buildingCenter = [(building.bounds.minlon + building.bounds.maxlon) / 2, (building.bounds.minlat + building.bounds.maxlat) / 2];
+      // Use actual polygon centroid instead of bounding box center
+      const centroid = turf.centroid(buildingGeometry);
+      const buildingCenter = centroid.geometry.coordinates;
 
       // Special handling for building=yes (mixed-use based on size)
       if (building.tags.building === 'yes') {
         mixedUseCounts[buildingType] = (mixedUseCounts[buildingType] || 0) + 1;
-        
-        // Calculate residential/commercial split based on building size
-        // Small buildings (<5000 sqft): 80% residential, 20% commercial
-        // Medium buildings (5000-20000 sqft): 50% residential, 50% commercial
-        // Large buildings (>20000 sqft): 30% residential, 70% commercial
+
+        // Calculate residential/commercial split based on building size (configurable thresholds)
+        // Small buildings: 80% residential, 20% commercial
+        // Medium buildings: interpolate to MIXED_USE_RESIDENTIAL_RATIO
+        // Large buildings: continue toward 30% residential, 70% commercial
         let residentialRatio, commercialRatio;
-        if (buildingArea < 5000) {
+        if (buildingArea < MIXED_USE_THRESHOLD_SMALL) {
           residentialRatio = 0.8;
           commercialRatio = 0.2;
-        } else if (buildingArea < 20000) {
-          // Linear interpolation between 5000 and 20000
-          const t = (buildingArea - 5000) / 15000; // 0 to 1
-          residentialRatio = 0.8 - (0.3 * t); // 0.8 -> 0.5
-          commercialRatio = 0.2 + (0.3 * t); // 0.2 -> 0.5
+        } else if (buildingArea < MIXED_USE_THRESHOLD_LARGE) {
+          // Linear interpolation between thresholds
+          const t = (buildingArea - MIXED_USE_THRESHOLD_SMALL) / (MIXED_USE_THRESHOLD_LARGE - MIXED_USE_THRESHOLD_SMALL);
+          residentialRatio = 0.8 - ((0.8 - MIXED_USE_RESIDENTIAL_RATIO) * t);
+          commercialRatio = 1 - residentialRatio;
         } else {
-          // Linear interpolation from 20000 to 100000 (cap at 70% commercial)
-          const t = Math.min(1, (buildingArea - 20000) / 80000); // 0 to 1
-          residentialRatio = 0.5 - (0.2 * t); // 0.5 -> 0.3
-          commercialRatio = 0.5 + (0.2 * t); // 0.5 -> 0.7
+          // Large buildings: continue toward 30/70 split
+          const t = Math.min(1, (buildingArea - MIXED_USE_THRESHOLD_LARGE) / 80000);
+          residentialRatio = MIXED_USE_RESIDENTIAL_RATIO - ((MIXED_USE_RESIDENTIAL_RATIO - 0.3) * t);
+          commercialRatio = 1 - residentialRatio;
         }
-        
+
         const residentialArea = buildingArea * residentialRatio;
         const commercialArea = buildingArea * commercialRatio;
-        
-        const approxPop = Math.floor(residentialArea / 400); // Mixed-use residential: smaller units (apartments)
-        const approxJobs = Math.floor(commercialArea / 200); // Mixed-use commercial: diverse (retail/office mix)
-        
+
+        // Apply multipliers to adjust population/job density
+        const approxPop = Math.floor(residentialArea / (400 * RESIDENTIAL_SQFT_MULTIPLIER));
+        const approxJobs = Math.floor(commercialArea / (200 * COMMERCIAL_SQFT_MULTIPLIER));
+
         calculatedBuildings[building.id] = {
           ...building,
           approxPop,
@@ -202,7 +263,7 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
         };
       } else if (squareFeetPerPopulation[building.tags.building]) { // residential
         residentialCounts[buildingType] = (residentialCounts[buildingType] || 0) + 1;
-        const approxPop = Math.floor(buildingArea / squareFeetPerPopulation[building.tags.building]);
+        const approxPop = Math.floor(buildingArea / (squareFeetPerPopulation[building.tags.building] * RESIDENTIAL_SQFT_MULTIPLIER));
         calculatedBuildings[building.id] = {
           ...building,
           approxPop,
@@ -210,7 +271,7 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
         };
       } else if (squareFeetPerJob[building.tags.building]) { // commercial/jobs
         commercialCounts[buildingType] = (commercialCounts[buildingType] || 0) + 1;
-        let approxJobs = Math.floor(buildingArea / squareFeetPerJob[building.tags.building]);
+        let approxJobs = Math.floor(buildingArea / (squareFeetPerJob[building.tags.building] * COMMERCIAL_SQFT_MULTIPLIER));
 
         if(building.tags.aeroway && building.tags.aeroway == 'terminal')
           approxJobs *= 20;
@@ -226,42 +287,12 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     }
   });
 
-  console.log(`Calculated buildings with population/jobs: ${Object.keys(calculatedBuildings).length} / ${rawBuildings.length}`);
-  console.log('\n=== BUILDING TYPE ANALYSIS ===');
-  console.log(`Total building types found: ${Object.keys(buildingTypeCounts).length}`);
-  console.log(`\nTop 20 most common building types:`);
-  Object.entries(buildingTypeCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .forEach(([type, count]) => {
-      const classification = mixedUseCounts[type] ? 'MIXED-USE' :
-                           residentialCounts[type] ? 'RESIDENTIAL' : 
-                           commercialCounts[type] ? 'COMMERCIAL' : 
-                           'UNCLASSIFIED';
-      console.log(`  ${type.padEnd(20)} - ${count.toString().padStart(7)} buildings (${classification})`);
-    });
-  
   const totalResidential = Object.values(residentialCounts).reduce((sum, n) => sum + n, 0);
   const totalCommercial = Object.values(commercialCounts).reduce((sum, n) => sum + n, 0);
   const totalMixedUse = Object.values(mixedUseCounts).reduce((sum, n) => sum + n, 0);
   const totalUnclassified = Object.values(unclassifiedCounts).reduce((sum, n) => sum + n, 0);
-  
-  console.log(`\nClassification summary:`);
-  console.log(`  Residential:   ${totalResidential.toString().padStart(7)} buildings (${(totalResidential/rawBuildings.length*100).toFixed(1)}%)`);
-  console.log(`  Commercial:    ${totalCommercial.toString().padStart(7)} buildings (${(totalCommercial/rawBuildings.length*100).toFixed(1)}%)`);
-  console.log(`  Mixed-Use:     ${totalMixedUse.toString().padStart(7)} buildings (${(totalMixedUse/rawBuildings.length*100).toFixed(1)}%)`);
-  console.log(`  Unclassified:  ${totalUnclassified.toString().padStart(7)} buildings (${(totalUnclassified/rawBuildings.length*100).toFixed(1)}%)`);
-  
-  if (totalUnclassified > 0) {
-    console.log(`\nTop 10 unclassified building types:`);
-    Object.entries(unclassifiedCounts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
-      .forEach(([type, count]) => {
-        console.log(`  ${type.padEnd(20)} - ${count.toString().padStart(7)} buildings`);
-      });
-  }
-  console.log('==============================\n');
+
+  console.log(`Buildings: ${Object.keys(calculatedBuildings).length}/${rawBuildings.length} classified (R:${totalResidential} C:${totalCommercial} M:${totalMixedUse} U:${totalUnclassified})`);
 
   // so we can do like, stuff with it
   const buildingsAsFeatureCollection = turf.featureCollection(
@@ -270,55 +301,25 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     )
   );
 
-  console.log(`Assigning buildings to neighborhoods and calculating connections...`);
+  console.log(`Assigning buildings to neighborhoods...`);
 
   let totalPopulation = 0;
   let totalJobs = 0;
   let finalVoronoiMembers = {}; // what buildings are in each voronoi
   let finalVoronoiMetadata = {}; // additional info on population and jobs
 
-  // OPTIMIZATION: Build a spatial grid for O(1) neighborhood lookups
-  // Instead of O(buildings × neighborhoods), we do O(grid_cells × neighborhoods + buildings)
-  const bbox = place.bbox; // [minLon, minLat, maxLon, maxLat]
-  const GRID_SIZE = Math.floor(centersOfNeighborhoodsFeatureCollection.features.length ** 0.5); //grid - tune for accuracy vs build time
-  const cellWidth = (bbox[2] - bbox[0]) / GRID_SIZE;
-  const cellHeight = (bbox[3] - bbox[1]) / GRID_SIZE;
-
-  console.log(`Building ${GRID_SIZE}x${GRID_SIZE} spatial index for fast neighborhood lookups...`);
-  
-  // Precompute nearest neighborhood for each grid cell center
-  const neighborhoodGrid = new Array(GRID_SIZE);
-  for (let x = 0; x < GRID_SIZE; x++) {
-    neighborhoodGrid[x] = new Array(GRID_SIZE);
-    for (let y = 0; y < GRID_SIZE; y++) {
-      const cellCenterLon = bbox[0] + (x + 0.5) * cellWidth;
-      const cellCenterLat = bbox[1] + (y + 0.5) * cellHeight;
-      const cellCenter = turf.point([cellCenterLon, cellCenterLat]);
-      const nearest = turf.nearestPoint(cellCenter, centersOfNeighborhoodsFeatureCollection);
-      neighborhoodGrid[x][y] = nearest.properties.placeID;
-    }
-  }
-  console.log(`Spatial index built.`);
-
-  // Fast building assignment using grid lookup - O(1) per building
-  const buildingAssignments = {}; // placeID -> array of building features
-  let count = 0;
+  // Direct assignment: find nearest neighborhood for each building
+  // Simple and accurate - no grid artifacts
+  const buildingAssignments = {};
   Object.values(calculatedBuildings).forEach((building) => {
-    const [lon, lat] = building.buildingCenter;
-    const gridX = Math.min(GRID_SIZE - 1, Math.max(0, Math.floor((lon - bbox[0]) / cellWidth)));
-    const gridY = Math.min(GRID_SIZE - 1, Math.max(0, Math.floor((lat - bbox[1]) / cellHeight)));
-    const placeID = neighborhoodGrid[gridX][gridY];
-    
-    if (!buildingAssignments[placeID]) buildingAssignments[placeID] = [];
-    const buildingPoint = turf.point(building.buildingCenter, { buildingID: building.id });
-    buildingAssignments[placeID].push(buildingPoint);
-    count++;
-    if (count % 10000 === 0) {
-      console.log(`Assigned ${count} buildings to neighborhoods...`);
-    }
-  });
+    const buildingPoint = turf.point(building.buildingCenter);
+    const nearest = turf.nearestPoint(buildingPoint, centersOfNeighborhoodsFeatureCollection);
+    const placeID = nearest.properties.placeID;
 
-  console.log(`Assigned ${count} buildings to neighborhoods.`);
+    if (!buildingAssignments[placeID]) buildingAssignments[placeID] = [];
+    buildingAssignments[placeID].push(turf.point(building.buildingCenter, { buildingID: building.id }));
+  });
+  console.log(`Building assignment complete.`);
 
   voronoi.features.forEach((feature) => {
     const placeID = feature.properties.placeID;
@@ -444,47 +445,102 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     let splitCount = 0;
     let newPlaceIdCounter = Date.now(); // Use timestamp to ensure unique IDs
     
+    // Configurable parameters for splitting algorithm
+    const SPLITTING_NUM_CLUSTERS_DIVISOR = config['splitting-num-clusters-divisor'] || 1250; // totalSize / divisor = numClusters
+    const SPLITTING_MIN_SEPARATION = config['splitting-cluster-min-separation'] || 0.002; // ~200m in degrees
+    
     placeIds.forEach(placeID => {
       const place = finalVoronoiMetadata[placeID];
       const totalSize = place.totalPopulation + place.totalJobs;
       
       if (totalSize <= MAX_SIZE_FOR_SPLITTING) return; // Not large enough to split
       
-      // Determine split grid size based on how large the neighborhood is
-      let gridSize = 2; // Default: 2x2 = 4 sub-neighborhoods
-      if (totalSize > MAX_SIZE_FOR_SPLITTING * 4) gridSize = 3; // 3x3 = 9 sub-neighborhoods
-      if (totalSize > MAX_SIZE_FOR_SPLITTING * 9) gridSize = 4; // 4x4 = 16 sub-neighborhoods
+      // Determine number of sub-clusters based on size (using configurable divisor)
+      let numClusters = Math.max(4, Math.min(16, Math.floor(totalSize / SPLITTING_NUM_CLUSTERS_DIVISOR)));
       
       const assignedBuildings = finalVoronoiMembers[placeID] || [];
       if (assignedBuildings.length === 0) return; // No buildings to redistribute
       
-      // Get the bounds of this neighborhood's buildings
-      const buildingCoords = assignedBuildings.map(b => b.geometry.coordinates);
-      const minLon = Math.min(...buildingCoords.map(c => c[0]));
-      const maxLon = Math.max(...buildingCoords.map(c => c[0]));
-      const minLat = Math.min(...buildingCoords.map(c => c[1]));
-      const maxLat = Math.max(...buildingCoords.map(c => c[1]));
+      // Instead of grid-based splitting, use weighted random sampling to pick cluster centers
+      // from actual building locations, weighted by population+jobs density
+      const buildingWeights = assignedBuildings.map(bf => {
+        const building = calculatedBuildings[bf.properties.buildingID];
+        return (building.approxPop ?? 0) + (building.approxJobs ?? 0) + 1; // +1 to avoid zero weights
+      });
       
-      // Create grid of sub-centers
+      const totalWeight = buildingWeights.reduce((sum, w) => sum + w, 0);
+      
+      // Select diverse initial centers using weighted random sampling with distance constraints
       const subCenters = [];
-      const cellWidth = (maxLon - minLon) / gridSize;
-      const cellHeight = (maxLat - minLat) / gridSize;
+      const maxAttempts = numClusters * 50;
+      let attempts = 0;
       
-      for (let x = 0; x < gridSize; x++) {
-        for (let y = 0; y < gridSize; y++) {
-          const centerLon = minLon + (x + 0.5) * cellWidth;
-          const centerLat = minLat + (y + 0.5) * cellHeight;
+      while (subCenters.length < numClusters && attempts < maxAttempts) {
+        attempts++;
+        
+        // Weighted random selection
+        let rand = Math.random() * totalWeight;
+        let selectedIdx = 0;
+        for (let i = 0; i < buildingWeights.length; i++) {
+          rand -= buildingWeights[i];
+          if (rand <= 0) {
+            selectedIdx = i;
+            break;
+          }
+        }
+        
+        const building = calculatedBuildings[assignedBuildings[selectedIdx].properties.buildingID];
+        const candidateLoc = building.buildingCenter;
+        
+        // Check if too close to existing centers
+        let tooClose = false;
+        for (const sub of subCenters) {
+          const dist = Math.sqrt(
+            Math.pow(candidateLoc[0] - sub.location[0], 2) +
+            Math.pow(candidateLoc[1] - sub.location[1], 2)
+          );
+          if (dist < SPLITTING_MIN_SEPARATION) {
+            tooClose = true;
+            break;
+          }
+        }
+        
+        if (!tooClose) {
           const subPlaceID = `${placeID}_split_${newPlaceIdCounter++}`;
-          
           subCenters.push({
             id: subPlaceID,
-            location: [centerLon, centerLat],
+            location: candidateLoc,
             buildings: [],
             totalPopulation: 0,
             totalJobs: 0
           });
         }
       }
+      
+      // If we couldn't get enough centers with constraints, fall back to pure random
+      while (subCenters.length < numClusters && subCenters.length < assignedBuildings.length) {
+        const randIdx = Math.floor(Math.random() * assignedBuildings.length);
+        const building = calculatedBuildings[assignedBuildings[randIdx].properties.buildingID];
+        const subPlaceID = `${placeID}_split_${newPlaceIdCounter++}`;
+        
+        // Check if this location is already used
+        const alreadyUsed = subCenters.some(sub => 
+          sub.location[0] === building.buildingCenter[0] && 
+          sub.location[1] === building.buildingCenter[1]
+        );
+        
+        if (!alreadyUsed) {
+          subCenters.push({
+            id: subPlaceID,
+            location: building.buildingCenter,
+            buildings: [],
+            totalPopulation: 0,
+            totalJobs: 0
+          });
+        }
+      }
+      
+      if (subCenters.length === 0) return; // Failed to create any centers
       
       // Redistribute buildings to nearest sub-center
       assignedBuildings.forEach(buildingFeature => {
@@ -588,11 +644,11 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
         centersOfNeighborhoods[innerPlace.placeID],
       ]), { units: 'meters' });
       
-      // Gravity model: (Jobs * Population) / distance^0.5
+      // Gravity model: (Jobs * Population) / distance^exponent
       // Lower exponent = less distance penalty = more long-distance connections (better for transit)
       // Use minimum distance to avoid division by zero for same-location connections
       const effectiveDistance = Math.max(connectionDistance, 100);
-      const gravity = (innerPlace.totalJobs * outerPlace.totalPopulation) / Math.pow(effectiveDistance, 0.5);
+      const gravity = (innerPlace.totalJobs * outerPlace.totalPopulation) / Math.pow(effectiveDistance, GRAVITY_EXPONENT);
       
       if (gravity > 0) {
         gravityScores.push({
@@ -614,9 +670,12 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     // Sort by gravity (highest first) for deterministic top selection
     gravityScores.sort((a, b) => b.gravity - a.gravity);
     
-    // Determine number of connections: scales with population (min 5, max 25)
+    // Determine number of connections: scales with population
     // Smaller places get fewer connections, larger places get more
-    const numConnections = Math.min(25, Math.max(5, Math.floor(Math.sqrt(totalDemand / 40))));
+    const numConnections = Math.min(
+      MAX_CONNECTIONS_PER_CLUSTER,
+      Math.max(MIN_CONNECTIONS_PER_CLUSTER, Math.floor(Math.sqrt(totalDemand / CONNECTION_SCALING_DIVISOR)))
+    );
     
     const selectedDestinations = new Set();
     
@@ -653,12 +712,11 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       const connectionDistance = item.distance;
       const connectionSeconds = connectionDistance * 0.12; // very scientific (hey, this is something i got from the subwaybuilder data)
       
-      // Split large connections into chunks of 200
-      const MAX_CONNECTION_SIZE = 200;
+      // Split large connections into chunks
       let remainingSize = connectionSize;
-      
+
       while (remainingSize > 0) {
-        const chunkSize = Math.min(MAX_CONNECTION_SIZE, remainingSize);
+        const chunkSize = Math.min(CONNECTION_SIZE_CAP, remainingSize);
         neighborhoodConnections.push({
           residenceId: outerPlace.placeID,
           jobId: item.innerPlace.placeID,
@@ -717,6 +775,13 @@ const processBuildings = (place, rawBuildings) => {
   rawBuildings.forEach((building, i) => {
     const __points = building.geometry.map((coord) => [coord.lon, coord.lat]);
     if (__points[0][0] !== __points[__points.length - 1][0] || __points[0][1] !== __points[__points.length - 1][1]) __points.push(__points[0]);
+    
+    // Skip invalid polygons (need at least 4 positions for a valid LinearRing)
+    if (__points.length < 4) {
+      buildingsRemoved++;
+      return;
+    }
+    
     const buildingPolygon = turf.polygon([__points]);
 
     buildingsToProcess.push({
@@ -1154,20 +1219,82 @@ const processAllData = async (place) => {
     writeStream.on('error', reject);
   });
   console.log(`  buildings_index.json written (${buildings.length} buildings)`);
-  fs.cpSync(`${import.meta.dirname}/raw_data/${place.code}/roads.geojson`, `${import.meta.dirname}/processed_data/${place.code}/roads.geojson`);
-  fs.cpSync(`${import.meta.dirname}/raw_data/${place.code}/runways_taxiways.geojson`, `${import.meta.dirname}/processed_data/${place.code}/runways_taxiways.geojson`);
+  // Copy raw data files with retry for parallel execution
+  const copyWithRetry = (src, dest, retries = 5) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        // Try to remove destination first if it exists
+        if (fs.existsSync(dest)) {
+          try {
+            fs.unlinkSync(dest);
+          } catch (e) {
+            // File might be locked, wait and retry
+          }
+        }
+        fs.cpSync(src, dest, { force: true, errorOnExist: false });
+        return;
+      } catch (err) {
+        if (i === retries - 1) {
+          // On last retry, just log and continue (file might already be copied)
+          console.warn(`Warning: Could not copy ${src} to ${dest}: ${err.message}`);
+          return;
+        }
+        // Wait before retrying (exponential backoff)
+        const delay = Math.min(100 * Math.pow(2, i), 1000);
+        const start = Date.now();
+        while (Date.now() - start < delay) {
+          // Busy wait (blocking)
+        }
+      }
+    }
+  };
+  
+  copyWithRetry(`${import.meta.dirname}/raw_data/${place.code}/roads.geojson`, `${import.meta.dirname}/processed_data/${place.code}/roads.geojson`);
+  copyWithRetry(`${import.meta.dirname}/raw_data/${place.code}/runways_taxiways.geojson`, `${import.meta.dirname}/processed_data/${place.code}/runways_taxiways.geojson`);
   fs.writeFileSync(`${import.meta.dirname}/processed_data/${place.code}/demand_data.json`, JSON.stringify(processedConnections), { encoding: 'utf8' });
   if (processedWater) {fs.writeFileSync(`${import.meta.dirname}/processed_data/${place.code}/ocean_depth_index.json`, JSON.stringify(processedWater), { encoding: 'utf8' });}
 };
 
-if (!fs.existsSync(`${import.meta.dirname}/processed_data`)) fs.mkdirSync(`${import.meta.dirname}/processed_data`);
+// Create base output directory (safe for parallel execution)
+try {
+  fs.mkdirSync(`${import.meta.dirname}/processed_data`, { recursive: true });
+} catch (err) {
+  if (err.code !== 'EEXIST') throw err;
+}
+
+// Force garbage collection if available (run with --expose-gc flag)
+const tryGC = () => {
+  if (global.gc) {
+    console.log('Running garbage collection...');
+    global.gc();
+  }
+};
 
 (async () => {
   for (const place of config.places) {
-    if (fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}`)) fs.rmSync(`${import.meta.dirname}/processed_data/${place.code}`, { recursive: true, force: true });
-    fs.mkdirSync(`${import.meta.dirname}/processed_data/${place.code}`)
+    const outputDir = `${import.meta.dirname}/processed_data/${place.code}`;
+    
+    // Safe directory creation for parallel execution
+    try {
+      if (fs.existsSync(outputDir)) {
+        fs.rmSync(outputDir, { recursive: true, force: true });
+      }
+    } catch (err) {
+      // Directory might have been deleted by another worker, ignore
+    }
+    
+    try {
+      fs.mkdirSync(outputDir, { recursive: true });
+    } catch (err) {
+      // Directory might have been created by another worker
+      if (err.code !== 'EEXIST') throw err;
+    }
+    
     await processAllData(place);
     console.log(`Finished processing ${place.code}.`);
+    
+    // Try to free memory before processing next map
+    tryGC();
   }
   console.log('All places processed successfully!');
 })();

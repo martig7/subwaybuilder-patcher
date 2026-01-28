@@ -1,0 +1,6 @@
+# Python dependencies for ML pipeline
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Bayesian optimization
+optuna>=3.0.0

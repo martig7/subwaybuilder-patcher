@@ -5,7 +5,18 @@ import { SphericalMercator } from '@mapbox/sphericalmercator';
 import { VectorTile } from '@mapbox/vector-tile';
 import Pbf from 'pbf';
 import zlib from 'zlib';
-import config from './config.js';
+
+// Load config from config.json (fallback to config.js)
+let config;
+const configJsonPath = path.join(import.meta.dirname, 'config.json');
+if (fs.existsSync(configJsonPath)) {
+  config = JSON.parse(fs.readFileSync(configJsonPath, 'utf-8'));
+  console.log('Loaded config from config.json');
+} else {
+  const configModule = await import('./config.js');
+  config = configModule.default;
+  console.log('Loaded config from config.js');
+}
 
 const mercator = new SphericalMercator({size: 256});
 const pmtilesPath = path.join(import.meta.dirname, 'map_tiles', 'pmtiles');

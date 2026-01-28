@@ -1,8 +1,10 @@
 import fs from 'fs';
-import config from './config.js';
 import config2 from '../../../config.js'
 import { spawn, execSync } from 'child_process';
 import { generateThumbnail } from './utils/create_thumbnail.js';
+
+// Load config from JSON file instead of JS
+const config = JSON.parse(fs.readFileSync(new URL('./config.json', import.meta.url), 'utf-8'));
 
 const stringReplaceAt = (string, startIndex, endIndex, replacement) => {
     return string.substring(0, startIndex) + replacement + string.substring(endIndex + 1);

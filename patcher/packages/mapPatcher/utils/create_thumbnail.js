@@ -2,8 +2,11 @@ import {VectorTile} from '@mapbox/vector-tile';
 import Protobuf from 'pbf';
 import {GeoJSON2SVG} from 'geojson2svg';
 import * as turf from '@turf/turf';
-import config from '../config.js';
+import fs from 'fs';
 import { SphericalMercator } from '@mapbox/sphericalmercator';
+
+// Load config from JSON file instead of JS
+const config = JSON.parse(fs.readFileSync(new URL('../config.json', import.meta.url), 'utf-8'));
 
 // By default, precomputes up to z30
 const merc = new SphericalMercator({
