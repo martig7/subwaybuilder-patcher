@@ -15,3 +15,5 @@ Step
 gzip.exe
 data
 extracted_app/
+map_tiles/
+processed_data/

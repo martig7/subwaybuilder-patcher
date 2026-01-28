@@ -1,15 +1,16 @@
 /**
  * Download OSM data for cities in config.json
  *
- * Usage: node download_data.js [--no-redownload]
+ * Usage: node download_data.js [--no-redownload] [--resume]
  *   --no-redownload  Skip cities that already have data in raw_data/
+ *   --resume         Resume from partial download (uses temp files)
  */
 
 import fs from 'fs';
 import { createParseStream, createStringifyStream } from 'big-json';
 import { Readable } from "stream";
 import * as turf from '@turf/turf';
-import { encode as msgpackEncode } from '@msgpack/msgpack';
+import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -31,7 +32,9 @@ if (fs.existsSync(configJsonPath)) {
 const convertBbox = (bbox) => [bbox[1], bbox[0], bbox[3], bbox[2]];
 
 const runQuery = async (query) => {
-  const res = await fetch("https://maps.mail.ru/osm/tools/overpass/api/interpreter", {
+  const endpoint = "https://maps.mail.ru/osm/tools/overpass/api/interpreter";
+  
+  const res = await fetch(endpoint, {
     "credentials": "omit",
     "headers": {
       "User-Agent": "SubwayBuilder-Patcher (https://github.com/piemadd/subwaybuilder-patcher)",
@@ -44,8 +47,15 @@ const runQuery = async (query) => {
   });
 
   if (!res.ok) {
-    console.log('Error fetching data, try again in ~30 seconds');
-    process.exit(1);
+    const errorText = await res.text();
+    throw new Error(`HTTP ${res.status}: ${errorText.substring(0, 200)}`);
+  }
+  
+  // Check if response is JSON
+  const contentType = res.headers.get('content-type');
+  if (!contentType || !contentType.includes('application/json')) {
+    const errorText = await res.text();
+    throw new Error(`Non-JSON response (${contentType}): ${errorText.substring(0, 200)}`);
   };
 
   let finalData = null;
@@ -60,9 +70,8 @@ const runQuery = async (query) => {
   });
 
   parseStream.on('error', (error) => {
-    console.error('Error parsing JSON stream:', error);
-    console.log('Error fetching data, try again in ~30 seconds');
-    process.exit(1);
+    console.error('Error parsing JSON stream:', error.message);
+    throw error;
   });
 
   await new Promise((resolve, reject) => {
@@ -185,7 +194,7 @@ out geom;`
   }
 };
 
-const fetchBuildingsData = async (bbox) => {
+const fetchBuildingsData = async (bbox, placeCode) => {
   // Split large bbox into tiles to avoid memory issues
   const [minLat, minLon, maxLat, maxLon] = bbox;
   const latDiff = maxLat - minLat;
@@ -193,6 +202,11 @@ const fetchBuildingsData = async (bbox) => {
   
   // Use smaller tiles if area is large (> 0.1 degrees ~11km)
   const shouldSplit = latDiff > 0.1 || lonDiff > 0.1;
+  
+  // Temp file for partial results
+  const tempFile = `${import.meta.dirname}/raw_data/${placeCode}/.buildings_temp.msgpack`;
+  const progressFile = `${import.meta.dirname}/raw_data/${placeCode}/.progress.json`;
+  const resumeMode = process.argv.includes('--resume');
   
   if (shouldSplit) {
     // Split into 4x4 grid (16 tiles)
@@ -202,49 +216,144 @@ const fetchBuildingsData = async (bbox) => {
     
     console.log(`Large area detected! Splitting into ${tilesPerSide}x${tilesPerSide} = ${tilesPerSide * tilesPerSide} tiles...`);
     
+    // Load existing data if resuming
     let allBuildings = [];
-    let tileCount = 0;
-    const totalTiles = tilesPerSide * tilesPerSide;
+    let completedTileIndices = new Set();
     
+    if (resumeMode) {
+      if (fs.existsSync(tempFile) && fs.existsSync(progressFile)) {
+        console.log(`--resume mode: Loading existing data from ${tempFile}...`);
+        const existingData = msgpackDecode(fs.readFileSync(tempFile));
+        const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
+        allBuildings = existingData;
+        completedTileIndices = new Set(progress.completedTiles);
+        console.log(`Loaded ${allBuildings.length} existing buildings from ${completedTileIndices.size} completed tiles. Continuing download...`);
+      } else if (fs.existsSync(tempFile) && !fs.existsSync(progressFile)) {
+        console.log(`⚠️  WARNING: Found old temp file without progress tracking.`);
+        console.log(`Cannot resume from old format - delete ${tempFile} and restart, or continue without --resume`);
+        process.exit(1);
+      } else {
+        console.log(`--resume mode: No existing data found, starting fresh...`);
+      }
+    }
+    
+    // Generate all tiles
+    const allTiles = [];
     for (let i = 0; i < tilesPerSide; i++) {
       for (let j = 0; j < tilesPerSide; j++) {
-        tileCount++;
-        const tileBbox = [
-          minLat + i * latStep,
-          minLon + j * lonStep,
-          minLat + (i + 1) * latStep,
-          minLon + (j + 1) * lonStep
-        ];
-        
-        console.log(`Fetching tile ${tileCount}/${totalTiles} (${tileBbox.join(',')})...`);
-        
-        const buildingQuery = `
+        allTiles.push({
+          bbox: [
+            minLat + i * latStep,
+            minLon + j * lonStep,
+            minLat + (i + 1) * latStep,
+            minLon + (j + 1) * lonStep
+          ],
+          index: i * tilesPerSide + j
+        });
+      }
+    }
+    
+    const totalTiles = allTiles.length;
+    const failedTiles = [];
+    
+    // Download tiles sequentially
+    for (let idx = 0; idx < allTiles.length; idx++) {
+      const tile = allTiles[idx];
+      const tileNum = tile.index + 1;
+      
+      // Skip already completed tiles
+      if (completedTileIndices.has(tile.index)) {
+        console.log(`Skipping tile ${tileNum}/${totalTiles} (already completed)`);
+        continue;
+      }
+      
+      console.log(`Fetching tile ${tileNum}/${totalTiles} (${((tileNum/totalTiles)*100).toFixed(1)}%)...`);
+      
+      const buildingQuery = `
 [out:json][timeout:180];
 (
-  way["building"](${tileBbox.join(',')});
+  way["building"](${tile.bbox.join(',')});
 );
 out geom;`;
+      
+      try {
+        const data = await runQuery(buildingQuery);
+        if (data.elements && data.elements.length > 0) {
+          console.log(`  Tile ${tileNum}: ${data.elements.length} buildings`);
+          const elements = data.elements;
+          allBuildings = allBuildings.concat(elements);
+          completedTileIndices.add(tile.index);
+          
+          // Save progress every 10 tiles
+          if (tileNum % 10 === 0) {
+            const tempData = msgpackEncode(allBuildings);
+            fs.writeFileSync(tempFile, tempData);
+            fs.writeFileSync(progressFile, JSON.stringify({
+              completedTiles: Array.from(completedTileIndices),
+              totalTiles: totalTiles
+            }));
+            console.log(`  Saved progress (${allBuildings.length} total buildings, ${completedTileIndices.size}/${totalTiles} tiles)`);
+          }
+          
+          data.elements = null;
+        } else {
+          console.log(`  Tile ${tileNum}: 0 buildings`);
+          completedTileIndices.add(tile.index);
+        }
         
+        // Delay between requests
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (err) {
+        console.error(`  Tile ${tileNum} failed:`, err.message);
+        
+        // Retry once
+        console.log(`  Retrying tile ${tileNum} in 5 seconds...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
         try {
           const data = await runQuery(buildingQuery);
           if (data.elements && data.elements.length > 0) {
-            console.log(`  Tile ${tileCount}: ${data.elements.length} buildings`);
-            // Use concat instead of spread to avoid stack overflow with large arrays
-            allBuildings = allBuildings.concat(data.elements);
+            console.log(`  Tile ${tileNum} RETRY SUCCESS: ${data.elements.length} buildings`);
+            const elements = data.elements;
+            allBuildings = allBuildings.concat(elements);
+            completedTileIndices.add(tile.index);
+            data.elements = null;
           } else {
-            console.log(`  Tile ${tileCount}: 0 buildings`);
+            completedTileIndices.add(tile.index);
           }
-          
-          // Add delay between requests to be nice to the API
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        } catch (err) {
-          console.error(`  Tile ${tileCount} failed:`, err.message);
-          console.log('  Continuing with next tile...');
+        } catch (retryErr) {
+          console.error(`  Tile ${tileNum} RETRY FAILED - skipping:`, retryErr.message);
+          failedTiles.push({ tile: tileNum, bbox: tile.bbox, error: retryErr.message });
         }
+      }
+      
+      // Periodic GC
+      if (tileNum % 25 === 0 && global.gc) {
+        global.gc();
+        console.log(`  Memory cleanup at tile ${tileNum}`);
       }
     }
     
     console.log(`Total buildings fetched: ${allBuildings.length}`);
+    
+    // Log summary
+    if (failedTiles.length > 0) {
+      console.log(`\n⚠️  WARNING: ${failedTiles.length} tiles failed and were skipped:`);
+      failedTiles.forEach(f => {
+        console.log(`  - Tile ${f.tile}: ${f.bbox.join(',')} - ${f.error}`);
+      });
+      console.log(`Temp files kept at: ${tempFile} and ${progressFile}`);
+      console.log(`Run with --resume to try failed tiles again, or continue with incomplete data\n`);
+    } else {
+      // Clean up temp files only if ALL tiles succeeded
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+      if (fs.existsSync(progressFile)) {
+        fs.unlinkSync(progressFile);
+      }
+      console.log(`✓ All tiles successful - cleaned up temp files`);
+    }
+    
     return allBuildings;
   } else {
     // Small area, fetch directly
@@ -302,7 +411,7 @@ const fetchAllData = async (place) => {
   const roadData = await fetchRoadData(convertedBoundingBox);
   console.timeEnd(`${place.name} (${place.code}) Road Data Fetch`);
   console.time(`${place.name} (${place.code}) Building Data Fetch`);
-  const buildingData = await fetchBuildingsData(convertedBoundingBox);
+  const buildingData = await fetchBuildingsData(convertedBoundingBox, place.code);
   console.timeEnd(`${place.name} (${place.code}) Building Data Fetch`);
   console.time(`${place.name} (${place.code}) Places Data Fetch`);
   const placesData = await fetchPlacesData(convertedBoundingBox);
