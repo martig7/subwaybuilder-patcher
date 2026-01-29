@@ -21,6 +21,19 @@ if (fs.existsSync(configJsonPath)) {
 const mercator = new SphericalMercator({size: 256});
 const pmtilesPath = path.join(import.meta.dirname, 'map_tiles', 'pmtiles');
 
+const tryDownloadWithDate = (date, place) => {
+    const dateStr = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}`;
+    const protomapsBucket = `https://build.protomaps.com/${dateStr}.pmtiles`;
+    const outputPath = path.join(import.meta.dirname, 'map_tiles', `${place.code}.pmtiles`);
+    
+    try {
+        execSync(`"${pmtilesPath}" extract ${protomapsBucket} --maxzoom=${config['tile-zoom-level']} --bbox="${place.bbox.join(',')}" "${outputPath}"`);
+        return true;
+    } catch (e) {
+        return false;
+    }
+};
+
 const extractWater = (place) => {
     console.log(`Extracting water layer for ${place.name}`);
     
@@ -79,13 +92,23 @@ const extractWater = (place) => {
     fs.writeFileSync(path.join(outputDir, 'water.geojson'), JSON.stringify({ type: "FeatureCollection", features }));
 };
 
-let date = new Date(Date.now() - 86400000); // Yesterday, in case todays build hasn't come out yet
-
-let protomapsBucket = `https://build.protomaps.com/${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}.pmtiles`
-
 console.log("Downloading map tiles");
 for(var place of config.places) {
     console.log(`Fetching tiles for ${place.name} (${place.code})`);
-    execSync(`${pmtilesPath} extract ${protomapsBucket} --maxzoom=${config['tile-zoom-level']} --bbox="${place.bbox.join(',')}" ${import.meta.dirname}/./map_tiles/${place.code}.pmtiles`);   
+    
+    // Try today's date first, then yesterday
+    const today = new Date();
+    const yesterday = new Date(Date.now() - 86400000);
+    
+    let success = tryDownloadWithDate(today, place);
+    if (!success) {
+        console.log(`  Today's build not available, trying yesterday...`);
+        success = tryDownloadWithDate(yesterday, place);
+    }
+    
+    if (!success) {
+        throw new Error(`Failed to download tiles for ${place.name}. Builds for today and yesterday are not available at https://build.protomaps.com/`);
+    }
+    
     extractWater(place);
 }
