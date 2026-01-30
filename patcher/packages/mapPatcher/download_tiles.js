@@ -24,12 +24,24 @@ const pmtilesPath = path.join(import.meta.dirname, 'map_tiles', 'pmtiles');
 const tryDownloadWithDate = (date, place) => {
     const dateStr = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}`;
     const protomapsBucket = `https://build.protomaps.com/${dateStr}.pmtiles`;
-    const outputPath = path.join(import.meta.dirname, 'map_tiles', `${place.code}.pmtiles`);
+    const outputPath = path.resolve(import.meta.dirname, 'map_tiles', `${place.code}.pmtiles`);
+    
+    // Delete existing file if it exists to ensure clean extraction
+    if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+    }
     
     try {
-        execSync(`"${pmtilesPath}" extract ${protomapsBucket} --maxzoom=${config['tile-zoom-level']} --bbox="${place.bbox.join(',')}" "${outputPath}"`);
-        return true;
+        execSync(`"${pmtilesPath}" extract ${protomapsBucket} --maxzoom=${config['tile-zoom-level']} --bbox="${place.bbox.join(',')}" "${outputPath}"`, {
+            stdio: 'inherit' // Show pmtiles output directly
+        });
+        return fs.existsSync(outputPath); // Verify file was created
     } catch (e) {
+        // pmtiles sometimes returns exit code 1 even on success - check if file exists
+        if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            console.log(`  Warning: pmtiles returned error code but file was created successfully`);
+            return true;
+        }
         return false;
     }
 };
