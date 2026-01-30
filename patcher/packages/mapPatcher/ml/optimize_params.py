@@ -30,7 +30,10 @@ except ImportError:
     HAS_PSUTIL = False
 
 # Import the Python processing module directly
-from process_data import process_all_places, ProcessingConfig, ensure_preclassified_exists, MAP_PATCHER_DIR
+from process_data import (
+    process_all_places, process_place, ProcessingConfig, Place,
+    ensure_preclassified_exists, MAP_PATCHER_DIR
+)
 
 
 # Thread-local storage for worker IDs
@@ -261,7 +264,7 @@ class OptimizationContext:
 
 
 def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
-    """Objective function for Optuna optimization"""
+    """Objective function for Optuna optimization with per-city pruning"""
 
     # Get stable worker ID for this thread (not trial-number based)
     worker_id = get_worker_id()
@@ -290,38 +293,85 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
             # Float parameters
             params[param_name] = trial.suggest_float(param_name, low, high)
 
-    # Run pipeline directly (no subprocess) — timed for reward signal
-    t0 = time.perf_counter()
-    if not context.run_pipeline(params):
-        context.cleanup()  # Clean up on failure
-        gc.collect()
-        return float('inf')
-    elapsed = time.perf_counter() - t0
+    # Build config
+    config = ProcessingConfig.from_dict({
+        **FIXED_PARAMS,
+        **params,
+        'places': context.target_places,
+        'skip-buildings-index': True,
+    })
 
-    # Extract features directly from results (no file I/O)
-    generated = context.extract_features()
-    if not generated:
-        context.cleanup()
-        gc.collect()
+    # Import feature extraction
+    try:
+        from extract_generated import extract_features, CityFeatures
+        from dataclasses import asdict
+    except ImportError as e:
+        print(f"W{worker_id}: Import error: {e}", file=sys.stderr)
         return float('inf')
 
+    # Process cities one at a time with per-city pruning
     total_error = 0.0
     match_count = 0
+    t0 = time.perf_counter()
 
-    for gen in generated:
-        gt_code = CITY_CODE_MAPPING.get(gen['city'], gen['city'])
-        gt = context.gt_by_city.get(gt_code)
+    for step, place_dict in enumerate(context.target_places):
+        code = place_dict['code']
+        
+        # Convert dict to Place object
+        place = Place(
+            code=code,
+            name=place_dict.get('name', code),
+            description=place_dict.get('description', ''),
+            bbox=place_dict['bbox'],
+            population=place_dict.get('population', 0)
+        )
+        
+        try:
+            # Process single city - returns demand_data directly (not wrapped)
+            demand_data = process_place(place, config)
 
-        if not gt:
-            print(f"W{worker_id}: No ground truth for {gen['city']} -> {gt_code}", file=sys.stderr)
-            continue
+            # Extract features for this city
+            if not demand_data.get('points'):
+                print(f"W{worker_id}: No points for {code}", file=sys.stderr)
+                continue
 
-        error = context.calculate_aggregate_error(gen, gt)
-        total_error += error
-        match_count += 1
+            features = extract_features(demand_data, code)
+            gen = asdict(features)
+
+            # Calculate error for this city
+            gt_code = CITY_CODE_MAPPING.get(code, code)
+            gt = context.gt_by_city.get(gt_code)
+
+            if not gt:
+                print(f"W{worker_id}: No ground truth for {code} -> {gt_code}", file=sys.stderr)
+                continue
+
+            city_error = context.calculate_aggregate_error(gen, gt)
+            total_error += city_error
+            match_count += 1
+
+            # Report cumulative average error after each city
+            if match_count > 0:
+                cumulative_avg_error = total_error / match_count
+                trial.report(cumulative_avg_error, step)
+
+                # Check if trial should be pruned (early stopping)
+                if trial.should_prune():
+                    context.cleanup()
+                    raise optuna.TrialPruned()
+
+        except optuna.TrialPruned:
+            raise  # Re-raise pruning exception
+        except Exception as e:
+            print(f"W{worker_id}: Error processing {code}: {e}", file=sys.stderr)
+            context.cleanup()
+            return float('inf')
+
+    elapsed = time.perf_counter() - t0
 
     if match_count == 0:
         print(f"W{worker_id}: No matching cities found", file=sys.stderr)
+        context.cleanup()
         return float('inf')
     
     avg_error = total_error / match_count
@@ -332,13 +382,7 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
     time_penalty = max(0.0, (elapsed - TIME_BASELINE) / TIME_BASELINE) * TIME_WEIGHT
     score = avg_error + time_penalty
 
-    # Report intermediate value for pruning
-    trial.report(score, match_count)
-
-    # Check if trial should be pruned
-    if trial.should_prune():
-        raise optuna.TrialPruned()
-
+    context.cleanup()
     return score
 
 
@@ -473,7 +517,7 @@ def main():
             interval_steps=1
         ),
         sampler=optuna.samplers.TPESampler(
-            n_startup_trials=20,  # Increase for better initial coverage
+            n_startup_trials=5,  # Increase for better initial coverage
             multivariate=True,
             group=True,  # Group correlated params automatically
             seed=42,
