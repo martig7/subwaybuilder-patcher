@@ -267,13 +267,20 @@ export async function patcherExec(fileContents) {
       promises.push(new Promise((resolve) => {
         generateThumbnail(place.code).then((svgString) => {
           const destFolder = path.join(citiesFolder, 'data', place.code);
+          const srcFolder = path.resolve(import.meta.dirname, 'processed_data', place.code);
+          
           fs.rmSync(destFolder, { recursive: true, force: true });
           fs.mkdirSync(destFolder, { recursive: true});
-          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'buildings_index.json'), path.join(destFolder, 'buildings_index.json'));
-          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'demand_data.json'), path.join(destFolder, 'demand_data.json'));
-          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'roads.geojson'), path.join(destFolder, 'roads.geojson'));
-          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'runways_taxiways.geojson'), path.join(destFolder, 'runways_taxiways.geojson'));
-          if (fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'ocean_depth_index.json'))) {fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'ocean_depth_index.json'), path.join(destFolder, 'ocean_depth_index.json'));}
+          
+          fs.copyFileSync(path.join(srcFolder, 'buildings_index.json'), path.join(destFolder, 'buildings_index.json'));
+          fs.copyFileSync(path.join(srcFolder, 'demand_data.json'), path.join(destFolder, 'demand_data.json'));
+          fs.copyFileSync(path.join(srcFolder, 'roads.geojson'), path.join(destFolder, 'roads.geojson'));
+          fs.copyFileSync(path.join(srcFolder, 'runways_taxiways.geojson'), path.join(destFolder, 'runways_taxiways.geojson'));
+          
+          if (fs.existsSync(path.join(srcFolder, 'ocean_depth_index.json'))) {
+            fs.copyFileSync(path.join(srcFolder, 'ocean_depth_index.json'), path.join(destFolder, 'ocean_depth_index.json'));
+          }
+          
           fs.writeFileSync(path.join(fileContents.PATHS.RENDERERDIR, 'city-maps', `${place.code.toLowerCase()}.svg`), svgString);
           const listOfPlaceFiles = fs.readdirSync(destFolder);
           listOfPlaceFiles.forEach(fileName => {
