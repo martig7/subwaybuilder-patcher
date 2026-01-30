@@ -18,3 +18,10 @@ extracted_app/
 Japan Pack/
 SubwayBuilder-CPH-main/
 bbox_storage.txt
+nul
+mod_output/
+test_config.json
+ground_truth_features.json
+ground_truth_features.csv
+optimization_results.json
+.claude/

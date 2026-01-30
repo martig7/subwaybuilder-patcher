@@ -18,9 +18,19 @@ from typing import Dict, Optional, List
 import argparse
 import sys
 import threading
+import time
+import gc
+import multiprocessing as mp
+
+# Try to import psutil for memory monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 # Import the Python processing module directly
-from process_data import process_all_places, ProcessingConfig
+from process_data import process_all_places, ProcessingConfig, ensure_preclassified_exists, MAP_PATCHER_DIR
 
 
 # Thread-local storage for worker IDs
@@ -47,20 +57,30 @@ PARAM_SPACE = {
     # Stage 1: Building → Population
     'residential-sqft-multiplier': (0.5, 2.0),
     'commercial-sqft-multiplier': (0.5, 2.0),
-    'mixed-use-residential-ratio': (0.3, 0.7),
+    'mixed-use-residential-ratio': (0.0, 1.0),
+    'yes-building-sqft-per-resident': (100, 800),
+    'yes-building-sqft-per-job': (50, 500),
+    'levels-default': (1.0, 4.0),
+    'levels-multiplier': (0.5, 2.0),
+    'min-building-area-sqft': (0, 1000),
+    'max-building-area-sqft': (0, 500000),
+    'residential-occupancy-rate': (0.7, 1.0),
     
     # Stage 2: Cluster management
     'max-place-size-for-splitting': (500, 10000),
     'merge-places-distance-meters': (0, 200),
     'splitting-num-clusters-divisor': (625, 5000),
-    'splitting-cluster-min-separation': (0.001, 0.004),
+    'splitting-cluster-min-separation': (0.001, 0.05),
     
     # Stage 3: Connection generation
+    'gravity-distance-floor-meters': (100, 5000),
     'gravity-exponent': (0.3, 1.5),
     'min-connections-per-cluster': (1, 5),
     'max-connections-per-cluster': (5, 25),
     'connection-scaling-divisor': (20, 160),
-    'population-scale-factor': (0.25, 1.0),
+    'population-scale-factor': (0.25, 2.0),
+    'max-total-connections': (0, 5000),
+    'max-connection-distance-meters': (0, 50000),  # 0 = unlimited
 }
 
 # Parameters to hold constant during optimization
@@ -71,24 +91,59 @@ FIXED_PARAMS = {
 }
 
 # Weights for aggregate error calculation (must sum to 1.0)
+# Emphasis on distribution shape: std, percentiles, min/max over mean/median
 ERROR_WEIGHTS = {
     # Stage 1: Total Population/Jobs - CRITICAL for map scale
-    'total_population': 0.15,
-    'total_jobs': 0.10,
-    
-    # Stage 2: Cluster Distribution
-    'cluster_count': 0.08,
-    'size_mean': 0.05,
-    'size_median': 0.05,
-    'size_max': 0.10,  # Critical: prevents mega-clusters
-    'size_std': 0.02,
-    'nn_dist_median': 0.05,
-    
-    # Stage 3: Connection Distribution
-    'connections_per_cluster': 0.12,
-    'conn_dist_median': 0.10,
-    'conn_size_mean': 0.08,
-    'graph_density': 0.10,
+    'total_population': 0.04,
+    'total_jobs': 0.03,
+
+    # Stage 2a: Residential size distribution
+    'res_size_std': 0.03,
+    'res_size_p10': 0.02,
+    'res_size_p25': 0.02,
+    'res_size_p75': 0.02,
+    'res_size_p90': 0.02,
+    'res_size_max': 0.03,  # Prevents mega-clusters
+
+    # Stage 2b: Commercial/job size distribution
+    'job_size_std': 0.03,
+    'job_size_p10': 0.02,
+    'job_size_p25': 0.02,
+    'job_size_p75': 0.02,
+    'job_size_p90': 0.02,
+    'job_size_max': 0.03,  # Prevents mega-clusters
+
+    # Stage 2c: Residential spacing distribution
+    'res_nn_dist_std': 0.02,
+    'res_nn_dist_p10': 0.06,
+    'res_nn_dist_p25': 0.01,
+    'res_nn_dist_p75': 0.01,
+    'res_nn_dist_p90': 0.02,
+    'res_nn_dist_max': 0.01,
+
+    # Stage 2d: Commercial spacing distribution
+    'job_nn_dist_std': 0.02,
+    'job_nn_dist_p10': 0.06,
+    'job_nn_dist_p25': 0.01,
+    'job_nn_dist_p75': 0.01,
+    'job_nn_dist_p90': 0.02,
+    'job_nn_dist_max': 0.01,
+
+    # Stage 2e: Overall cluster structure
+    'cluster_count': 0.05,
+
+    # Stage 3a: Connection distance distribution
+    'conn_dist_std': 0.02,
+    'conn_dist_p10': 0.02,
+    'conn_dist_p25': 0.02,
+    'conn_dist_p75': 0.02,
+    'conn_dist_p90': 0.02,
+    'conn_dist_max': 0.02,
+
+    # Stage 3b: Connection structure
+    'connections_per_cluster': 0.05,
+    'conn_size_mean': 0.04,
+    'graph_density': 0.06,
 }
 
 # City code mapping
@@ -102,19 +157,21 @@ CITY_CODE_MAPPING = {
     'SEA_GEN': 'SEA',
     'DEN_GEN': 'DEN',
     'LON_GEN': 'LON',
+    'PHL_GEN': 'PHL',
 }
 
 
 class OptimizationContext:
     """Shared context for optimization trials"""
 
-    def __init__(self, target_places: list, ground_truth: dict, worker_id: int = 0):
+    def __init__(self, target_places: list, gt_by_city: dict, worker_id: int = 0):
         self.target_places = target_places
-        self.gt_by_city = {gt['city']: gt for gt in ground_truth}
+        self.gt_by_city = gt_by_city  # Now shared across workers
         self.script_dir = Path(__file__).parent
         self.map_patcher_dir = self.script_dir.parent
         self.worker_id = worker_id
         self.last_result = None  # Store last processing result for feature extraction
+        self._temp_files = []  # Track temp files to clean up
 
     def run_pipeline(self, params: Dict) -> bool:
         """Run Python processing pipeline directly (no subprocess)"""
@@ -124,6 +181,7 @@ class OptimizationContext:
                 **FIXED_PARAMS,
                 **params,
                 'places': self.target_places,
+                'skip-buildings-index': True,  # Skip during optimization (faster)
             }
 
             # Run processing directly
@@ -141,6 +199,18 @@ class OptimizationContext:
         except Exception as e:
             print(f"W{self.worker_id}: Pipeline error: {e}", file=sys.stderr)
             return False
+    
+    def cleanup(self):
+        """Clean up temporary data to free memory"""
+        self.last_result = None
+        for temp_file in self._temp_files:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
+        self._temp_files.clear()
+        gc.collect()
 
     def extract_features(self) -> Optional[List[Dict]]:
         """Extract features from last processing result (no subprocess)"""
@@ -197,26 +267,42 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
     worker_id = get_worker_id()
     context.worker_id = worker_id
 
+    # Memory monitoring (if available)
+    if HAS_PSUTIL:
+        import os
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+
     # Suggest parameters based on their types
     params = {}
 
     for param_name, (low, high) in PARAM_SPACE.items():
         if param_name in ['max-place-size-for-splitting', 'merge-places-distance-meters',
                           'splitting-num-clusters-divisor', 'min-connections-per-cluster',
-                          'max-connections-per-cluster', 'connection-scaling-divisor']:
+                          'max-connections-per-cluster', 'connection-scaling-divisor',
+                          'max-total-connections', 'max-connection-distance-meters',
+                          'gravity-distance-floor-meters',
+                          'yes-building-sqft-per-resident', 'yes-building-sqft-per-job',
+                          'min-building-area-sqft', 'max-building-area-sqft']:
             # Integer parameters
             params[param_name] = trial.suggest_int(param_name, int(low), int(high))
         else:
             # Float parameters
             params[param_name] = trial.suggest_float(param_name, low, high)
 
-    # Run pipeline directly (no subprocess)
+    # Run pipeline directly (no subprocess) — timed for reward signal
+    t0 = time.perf_counter()
     if not context.run_pipeline(params):
+        context.cleanup()  # Clean up on failure
+        gc.collect()
         return float('inf')
+    elapsed = time.perf_counter() - t0
 
     # Extract features directly from results (no file I/O)
     generated = context.extract_features()
     if not generated:
+        context.cleanup()
+        gc.collect()
         return float('inf')
 
     total_error = 0.0
@@ -239,15 +325,39 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
         return float('inf')
     
     avg_error = total_error / match_count
-    
+
+    # Time-based reward: penalize slow configs
+    TIME_WEIGHT = 0.02   # 2% of objective from processing time
+    TIME_BASELINE = 240.0 # seconds — expected normal duration
+    time_penalty = max(0.0, (elapsed - TIME_BASELINE) / TIME_BASELINE) * TIME_WEIGHT
+    score = avg_error + time_penalty
+
     # Report intermediate value for pruning
-    trial.report(avg_error, match_count)
-    
+    trial.report(score, match_count)
+
     # Check if trial should be pruned
     if trial.should_prune():
         raise optuna.TrialPruned()
+
+    return score
+
+
+def load_ground_truth_shared(gt_path: Path) -> dict:
+    """Load ground truth into shared memory for worker reuse"""
+    print('Loading ground truth into shared memory...')
     
-    return avg_error
+    with open(gt_path, 'r') as f:
+        ground_truth = json.load(f)
+    
+    # Create shared dict accessible by all workers
+    manager = mp.Manager()
+    shared_gt = manager.dict()
+    
+    for gt in ground_truth:
+        shared_gt[gt['city']] = gt
+    
+    print(f'  Loaded {len(shared_gt)} cities into shared memory')
+    return shared_gt
 
 
 def main():
@@ -268,15 +378,13 @@ def main():
     script_dir = Path(__file__).parent
     map_patcher_dir = script_dir.parent
     
-    # Load ground truth
-    print('Loading ground truth...')
+    # Load ground truth into shared memory
     gt_path = script_dir / 'ground_truth_features.json'
     if not gt_path.exists():
         print('Error: Ground truth not found. Run extract_ground_truth.py first.')
         return
     
-    with open(gt_path, 'r') as f:
-        ground_truth = json.load(f)
+    gt_by_city = load_ground_truth_shared(gt_path)
     
     # Load current config to get places
     config_path = map_patcher_dir / 'config.js'
@@ -324,8 +432,31 @@ def main():
     else:
         target_places = places
     
-    # Create optimization context
-    context = OptimizationContext(target_places, ground_truth)
+    # Create optimization context with shared ground truth
+    context = OptimizationContext(target_places, gt_by_city)
+    
+    # Preclassify buildings for all target cities (one-time cost, huge speedup per trial)
+    print(f"\nEnsuring preclassified buildings exist...")
+    preclassify_count = 0
+    for place_dict in target_places:
+        code = place_dict['code']
+        raw_data_dir = MAP_PATCHER_DIR / 'raw_data' / code
+        preclassified_path = raw_data_dir / 'buildings_preclassified.msgpack'
+        
+        if preclassified_path.exists():
+            size_mb = preclassified_path.stat().st_size / 1_000_000
+            print(f"  {code}: Using cached preclassified buildings ({size_mb:.1f}MB)")
+        else:
+            print(f"  {code}: Creating preclassified buildings cache...")
+            result = ensure_preclassified_exists(code, raw_data_dir)
+            if result:
+                preclassify_count += 1
+                print(f"  {code}: ✓ Preclassified successfully")
+            else:
+                print(f"  {code}: ✗ Failed - will use slower path")
+    
+    if preclassify_count > 0:
+        print(f"  Created {preclassify_count} new preclassified caches")
     
     # Create Optuna study
     print(f"\nStarting Bayesian Optimization:")
@@ -342,12 +473,48 @@ def main():
             interval_steps=1
         ),
         sampler=optuna.samplers.TPESampler(
-            n_startup_trials=10,
+            n_startup_trials=20,  # Increase for better initial coverage
             multivariate=True,
-            seed=42
+            group=True,  # Group correlated params automatically
+            seed=42,
+            constant_liar=True,  # Better parallel performance
         )
     )
     
+    # Seed study with known-good parameters from prior runs
+    seed_count = 0
+
+    # 1. Enqueue current config.json params (only params that exist in search space)
+    seed_params = {k: current_config[k] for k in PARAM_SPACE if k in current_config}
+    if seed_params:
+        study.enqueue_trial(seed_params)
+        seed_count += 1
+
+    # 2. Enqueue top trials from previous optimization results
+    results_path = script_dir / 'optimization_results.json'
+    if results_path.exists():
+        try:
+            with open(results_path, 'r') as f:
+                prev_results = json.load(f)
+            for trial_data in prev_results.get('trials', [])[:5]:
+                if trial_data.get('value') is None:
+                    continue
+                # Only include params that exist in current search space;
+                # new params will be sampled randomly by Optuna
+                trial_params = {k: v for k, v in trial_data['params'].items()
+                                if k in PARAM_SPACE}
+                if trial_params and trial_params != seed_params:
+                    study.enqueue_trial(trial_params)
+                    seed_count += 1
+        except Exception as e:
+            print(f"  Warning: Could not load previous results: {e}")
+
+    if seed_count > 0:
+        print(f"  Seeded {seed_count} trials from prior runs")
+        missing = set(PARAM_SPACE) - set(seed_params)
+        if missing:
+            print(f"  New params (randomly initialized): {', '.join(sorted(missing))}")
+
     # Run optimization
     try:
         study.optimize(

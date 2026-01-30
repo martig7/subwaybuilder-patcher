@@ -1,9 +1,10 @@
 /**
  * Download OSM data for cities in config.json
  *
- * Usage: node download_data.js [--no-redownload] [--resume]
+ * Usage: node download_data.js [--no-redownload] [--resume] [--config <file>]
  *   --no-redownload  Skip cities that already have data in raw_data/
  *   --resume         Resume from partial download (uses temp files)
+ *   --config <file>  Use a different config file (default: config.json)
  */
 
 import fs from 'fs';
@@ -17,69 +18,98 @@ import { dirname, join } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Load config from config.json (fallback to config.js)
+// Parse --config flag
+const configArgIdx = process.argv.indexOf('--config');
+const configFileName = (configArgIdx !== -1 && process.argv[configArgIdx + 1])
+  ? process.argv[configArgIdx + 1]
+  : 'config.json';
+
+// Load config (fallback to config.js if file not found)
 let config;
-const configJsonPath = join(__dirname, 'config.json');
+const configJsonPath = join(__dirname, configFileName);
 if (fs.existsSync(configJsonPath)) {
   config = JSON.parse(fs.readFileSync(configJsonPath, 'utf-8'));
-  console.log('Loaded config from config.json');
-} else {
+  console.log(`Loaded config from ${configFileName}`);
+} else if (configFileName === 'config.json') {
   const configModule = await import('./config.js');
   config = configModule.default;
   console.log('Loaded config from config.js');
+} else {
+  console.error(`Config file not found: ${configFileName}`);
+  process.exit(1);
 }
 
 const convertBbox = (bbox) => [bbox[1], bbox[0], bbox[3], bbox[2]];
 
-const runQuery = async (query) => {
+const runQuery = async (query, retries = 3) => {
   const endpoint = "https://maps.mail.ru/osm/tools/overpass/api/interpreter";
   
-  const res = await fetch(endpoint, {
-    "credentials": "omit",
-    "headers": {
-      "User-Agent": "SubwayBuilder-Patcher (https://github.com/piemadd/subwaybuilder-patcher)",
-      "Accept": "*/*",
-      "Accept-Language": "en-US,en;q=0.5"
-    },
-    "body": `data=${encodeURIComponent(query)}`,
-    "method": "POST",
-    "mode": "cors"
-  });
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
+      
+      const res = await fetch(endpoint, {
+        "credentials": "omit",
+        "headers": {
+          "User-Agent": "SubwayBuilder-Patcher (https://github.com/piemadd/subwaybuilder-patcher)",
+          "Accept": "*/*",
+          "Accept-Language": "en-US,en;q=0.5"
+        },
+        "body": `data=${encodeURIComponent(query)}`,
+        "method": "POST",
+        "mode": "cors",
+        "signal": controller.signal
+      });
+      
+      clearTimeout(timeoutId);
 
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`HTTP ${res.status}: ${errorText.substring(0, 200)}`);
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`HTTP ${res.status}: ${errorText.substring(0, 200)}`);
+      }
+      
+      // Check if response is JSON
+      const contentType = res.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        const errorText = await res.text();
+        throw new Error(`Non-JSON response (${contentType}): ${errorText.substring(0, 200)}`);
+      };
+
+      let finalData = null;
+
+      const parseStream = createParseStream();
+      Readable.fromWeb(res.body).pipe(parseStream);
+
+
+      // Listen for parsed objects
+      parseStream.on('data', (data) => {
+        finalData = data;
+      });
+
+      parseStream.on('error', (error) => {
+        console.error('Error parsing JSON stream:', error.message);
+        throw error;
+      });
+
+      await new Promise((resolve, reject) => {
+        parseStream.on('end', resolve);
+        parseStream.on('error', reject);
+      });
+
+      return finalData;
+      
+    } catch (error) {
+      if (attempt < retries) {
+        const waitTime = Math.min(1000 * Math.pow(2, attempt - 1), 10000); // Exponential backoff, max 10s
+        console.log(`  Attempt ${attempt} failed: ${error.message}`);
+        console.log(`  Retrying in ${waitTime / 1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else {
+        throw error;
+      }
+    }
   }
-  
-  // Check if response is JSON
-  const contentType = res.headers.get('content-type');
-  if (!contentType || !contentType.includes('application/json')) {
-    const errorText = await res.text();
-    throw new Error(`Non-JSON response (${contentType}): ${errorText.substring(0, 200)}`);
-  };
-
-  let finalData = null;
-
-  const parseStream = createParseStream();
-  Readable.fromWeb(res.body).pipe(parseStream);
-
-
-  // Listen for parsed objects
-  parseStream.on('data', (data) => {
-    finalData = data;
-  });
-
-  parseStream.on('error', (error) => {
-    console.error('Error parsing JSON stream:', error.message);
-    throw error;
-  });
-
-  await new Promise((resolve, reject) => {
-    parseStream.on('end', resolve);
-    parseStream.on('error', reject);
-  });
-
-  return finalData;
 };
 
 const getStreetName = (tags, preferLocale = 'en') => {
@@ -94,48 +124,50 @@ const getStreetName = (tags, preferLocale = 'en') => {
 };
 
 const fetchRunwayTaxiwayData = async (bbox) => {
-  const runwayTaxiwayQuery = `
-[out:json][timeout:180];
-(
-  way["aeroway"="runway"](${bbox.join(',')});
-  way["aeroway"="taxiway"](${bbox.join(',')});
-  way["aeroway"="apron"](${bbox.join(',')});
-);
-out geom;`;
-  const data = await runQuery(runwayTaxiwayQuery);
-  return {
-    "type": "FeatureCollection", "features": data.elements.map((element) => {
-      if(element.tags.aeroway !== "runway" && element.tags.aeroway !== "taxiway") {
-      return {
-        "type": "Feature",
-        "properties": {
-          roadType: "runway",
-          aeroway: element.tags.aeroway,
-          osm_way_id: new String(element.id),
-          area: turf.area(turf.polygon([element.geometry.map((coord) => [coord.lon, coord.lat])])),
-        },
-        "geometry": {
-          "type": "Polygon",
-          "coordinates": [element.geometry.map((coord) => [coord.lon, coord.lat])],
+    console.log(`Fetching runway and taxiway data`);
+    
+    const query = `
+        [out:json][timeout:60];
+        (
+            way["aeroway"="runway"](${bbox.join(',')});
+            way["aeroway"="taxiway"](${bbox.join(',')});
+        );
+        out geom;
+    `;
+
+    const data = await runQuery(query);
+    
+    const features = data.elements.map(el => {
+        if (el.type === 'way' && el.geometry) {
+            const coords = el.geometry.map(node => [node.lon, node.lat]);
+            
+            // Close the ring if it's not already closed
+            if (coords.length > 0) {
+                const first = coords[0];
+                const last = coords[coords.length - 1];
+                if (first[0] !== last[0] || first[1] !== last[1]) {
+                    coords.push([...first]); // Add copy of first coordinate
+                }
+            }
+            
+            // Only create polygon if we have at least 4 coordinates (including closing point)
+            if (coords.length < 4) {
+                console.warn(`Skipping runway/taxiway with insufficient coordinates: ${el.id}`);
+                return null;
+            }
+            
+            return turf.polygon([coords], {
+                aeroway: el.tags.aeroway,
+                name: el.tags.name || '',
+                ref: el.tags.ref || ''
+            });
         }
-      }
-   } else {
-      return {
-        "type": "Feature",
-        "properties": {
-          roadType: "runway",
-          z_order: 0,
-          osm_way_id: new String(element.id),
-          area: turf.area(turf.lineString(element.geometry.map((coord) => [coord.lon, coord.lat]))),
-        },
-        "geometry": {
-          "type": "Polygon",
-          "coordinates": [turf.buffer(turf.lineString(element.geometry.map((coord) => [coord.lon, coord.lat])), element.tags.aeroway == "runway" ? 30 : 10, { units: 'meters' }).geometry.coordinates[0]],
-        }
-      }
-    }
-    })
-  }
+        return null;
+    }).filter(f => f !== null);
+
+    console.log(`Found ${features.length} runways and taxiways.`);
+    
+    return { type: "FeatureCollection", features };
 };
 
 const fetchRoadData = async (bbox) => {

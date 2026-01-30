@@ -31,7 +31,8 @@ CITIES = [
 class CityFeatures:
     """Statistical features for a city's ground truth data"""
     city: str
-    
+    bbox: list  # [minLon, minLat, maxLon, maxLat]
+
     # Stage 2: Cluster Distribution
     cluster_count: int
     size_mean: float
@@ -40,21 +41,54 @@ class CityFeatures:
     size_p90: float
     size_min: float
     size_max: float
+    res_size_min: float
+    res_size_p10: float
+    res_size_p25: float
+    res_size_p75: float
+    res_size_p90: float
+    res_size_max: float
+    res_size_std: float
+    job_size_min: float
+    job_size_p10: float
+    job_size_p25: float
+    job_size_p75: float
+    job_size_p90: float
+    job_size_max: float
+    job_size_std: float
     total_population: int
     total_jobs: int
     jobs_ratio: float
     nn_dist_mean: float
     nn_dist_median: float
     nn_dist_p90: float
+    res_nn_dist_min: float
+    res_nn_dist_p10: float
+    res_nn_dist_p25: float
+    res_nn_dist_p75: float
+    res_nn_dist_p90: float
+    res_nn_dist_max: float
+    res_nn_dist_std: float
+    job_nn_dist_min: float
+    job_nn_dist_p10: float
+    job_nn_dist_p25: float
+    job_nn_dist_p75: float
+    job_nn_dist_p90: float
+    job_nn_dist_max: float
+    job_nn_dist_std: float
     area_km2: float
     density: float
     
     # Stage 3: Connection Distribution
     connection_count: int
     connections_per_cluster: float
-    conn_dist_mean: float
+    conn_dist_min: float
+    conn_dist_p10: float
+    conn_dist_p25: float
     conn_dist_median: float
+    conn_dist_p75: float
     conn_dist_p90: float
+    conn_dist_max: float
+    conn_dist_std: float
     conn_size_mean: float
     conn_size_median: float
     conn_size_p90: float
@@ -146,16 +180,32 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
     
     if not points:
         raise ValueError(f"No points found for {city_code}")
-    
+
+    # Compute bbox from point locations (with 2% padding)
+    lons_all = [p['location'][0] for p in points]
+    lats_all = [p['location'][1] for p in points]
+    pad_lon = (max(lons_all) - min(lons_all)) * 0.02
+    pad_lat = (max(lats_all) - min(lats_all)) * 0.02
+    bbox = [min(lons_all) - pad_lon, min(lats_all) - pad_lat,
+            max(lons_all) + pad_lon, max(lats_all) + pad_lat]
+
     # Stage 2: Cluster Distribution Metrics
     sizes = np.array([p.get('jobs', 0) + p.get('residents', 0) for p in points])
+    res_sizes = np.array([p.get('residents', 0) for p in points])
+    job_sizes = np.array([p.get('jobs', 0) for p in points])
     total_jobs = sum(p.get('jobs', 0) for p in points)
     total_residents = sum(p.get('residents', 0) for p in points)
     total_size = total_jobs + total_residents
     
     area_km2 = calculate_area_km2(points)
     nn_distances = calculate_nearest_neighbor_distances(points)
-    
+
+    # Separate NN distances for residential and job nodes
+    res_points = [p for p in points if p.get('residents', 0) > 0]
+    job_points_list = [p for p in points if p.get('jobs', 0) > 0]
+    res_nn_distances = calculate_nearest_neighbor_distances(res_points)
+    job_nn_distances = calculate_nearest_neighbor_distances(job_points_list)
+
     # Stage 3: Connection Distribution Metrics
     conn_distances = np.array([p.get('drivingDistance', 0) for p in pops])
     conn_sizes = np.array([p.get('size', 0) for p in pops])
@@ -170,7 +220,8 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
     
     return CityFeatures(
         city=city_code,
-        
+        bbox=bbox,
+
         # Stage 2: Cluster Distribution
         cluster_count=len(points),
         size_mean=float(sizes.mean()) if len(sizes) > 0 else 0.0,
@@ -179,21 +230,54 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
         size_p90=float(np.percentile(sizes, 90)) if len(sizes) > 0 else 0.0,
         size_min=float(sizes.min()) if len(sizes) > 0 else 0.0,
         size_max=float(sizes.max()) if len(sizes) > 0 else 0.0,
+        res_size_min=float(res_sizes.min()) if len(res_sizes) > 0 else 0.0,
+        res_size_p10=float(np.percentile(res_sizes, 10)) if len(res_sizes) > 0 else 0.0,
+        res_size_p25=float(np.percentile(res_sizes, 25)) if len(res_sizes) > 0 else 0.0,
+        res_size_p75=float(np.percentile(res_sizes, 75)) if len(res_sizes) > 0 else 0.0,
+        res_size_p90=float(np.percentile(res_sizes, 90)) if len(res_sizes) > 0 else 0.0,
+        res_size_max=float(res_sizes.max()) if len(res_sizes) > 0 else 0.0,
+        res_size_std=float(res_sizes.std()) if len(res_sizes) > 0 else 0.0,
+        job_size_min=float(job_sizes.min()) if len(job_sizes) > 0 else 0.0,
+        job_size_p10=float(np.percentile(job_sizes, 10)) if len(job_sizes) > 0 else 0.0,
+        job_size_p25=float(np.percentile(job_sizes, 25)) if len(job_sizes) > 0 else 0.0,
+        job_size_p75=float(np.percentile(job_sizes, 75)) if len(job_sizes) > 0 else 0.0,
+        job_size_p90=float(np.percentile(job_sizes, 90)) if len(job_sizes) > 0 else 0.0,
+        job_size_max=float(job_sizes.max()) if len(job_sizes) > 0 else 0.0,
+        job_size_std=float(job_sizes.std()) if len(job_sizes) > 0 else 0.0,
         total_population=int(total_residents),
         total_jobs=int(total_jobs),
         jobs_ratio=total_jobs / total_size if total_size > 0 else 0.0,
         nn_dist_mean=float(nn_distances.mean()) if len(nn_distances) > 0 else 0.0,
         nn_dist_median=float(np.median(nn_distances)) if len(nn_distances) > 0 else 0.0,
         nn_dist_p90=float(np.percentile(nn_distances, 90)) if len(nn_distances) > 0 else 0.0,
+        res_nn_dist_min=float(res_nn_distances.min()) if len(res_nn_distances) > 0 else 0.0,
+        res_nn_dist_p10=float(np.percentile(res_nn_distances, 10)) if len(res_nn_distances) > 0 else 0.0,
+        res_nn_dist_p25=float(np.percentile(res_nn_distances, 25)) if len(res_nn_distances) > 0 else 0.0,
+        res_nn_dist_p75=float(np.percentile(res_nn_distances, 75)) if len(res_nn_distances) > 0 else 0.0,
+        res_nn_dist_p90=float(np.percentile(res_nn_distances, 90)) if len(res_nn_distances) > 0 else 0.0,
+        res_nn_dist_max=float(res_nn_distances.max()) if len(res_nn_distances) > 0 else 0.0,
+        res_nn_dist_std=float(res_nn_distances.std()) if len(res_nn_distances) > 0 else 0.0,
+        job_nn_dist_min=float(job_nn_distances.min()) if len(job_nn_distances) > 0 else 0.0,
+        job_nn_dist_p10=float(np.percentile(job_nn_distances, 10)) if len(job_nn_distances) > 0 else 0.0,
+        job_nn_dist_p25=float(np.percentile(job_nn_distances, 25)) if len(job_nn_distances) > 0 else 0.0,
+        job_nn_dist_p75=float(np.percentile(job_nn_distances, 75)) if len(job_nn_distances) > 0 else 0.0,
+        job_nn_dist_p90=float(np.percentile(job_nn_distances, 90)) if len(job_nn_distances) > 0 else 0.0,
+        job_nn_dist_max=float(job_nn_distances.max()) if len(job_nn_distances) > 0 else 0.0,
+        job_nn_dist_std=float(job_nn_distances.std()) if len(job_nn_distances) > 0 else 0.0,
         area_km2=area_km2,
         density=len(points) / area_km2 if area_km2 > 0 else 0.0,
         
         # Stage 3: Connection Distribution
         connection_count=len(pops),
         connections_per_cluster=len(pops) / len(points) if len(points) > 0 else 0.0,
-        conn_dist_mean=float(conn_distances.mean()) if len(conn_distances) > 0 else 0.0,
+        conn_dist_min=float(conn_distances.min()) if len(conn_distances) > 0 else 0.0,
+        conn_dist_p10=float(np.percentile(conn_distances, 10)) if len(conn_distances) > 0 else 0.0,
+        conn_dist_p25=float(np.percentile(conn_distances, 25)) if len(conn_distances) > 0 else 0.0,
         conn_dist_median=float(np.median(conn_distances)) if len(conn_distances) > 0 else 0.0,
+        conn_dist_p75=float(np.percentile(conn_distances, 75)) if len(conn_distances) > 0 else 0.0,
         conn_dist_p90=float(np.percentile(conn_distances, 90)) if len(conn_distances) > 0 else 0.0,
+        conn_dist_max=float(conn_distances.max()) if len(conn_distances) > 0 else 0.0,
+        conn_dist_std=float(conn_distances.std()) if len(conn_distances) > 0 else 0.0,
         conn_size_mean=float(conn_sizes.mean()) if len(conn_sizes) > 0 else 0.0,
         conn_size_median=float(np.median(conn_sizes)) if len(conn_sizes) > 0 else 0.0,
         conn_size_p90=float(np.percentile(conn_sizes, 90)) if len(conn_sizes) > 0 else 0.0,
@@ -204,7 +288,7 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
 def main():
     """Extract features from all ground truth cities"""
     appdata_path = get_appdata_path()
-    game_data_path = appdata_path / 'subway_builder' / 'resources' / 'cities'
+    game_data_path = appdata_path / 'metro-maker4' / 'cities' / 'data'
     
     if not game_data_path.exists():
         print(f"Error: Game data not found at {game_data_path}")
