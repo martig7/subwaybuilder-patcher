@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import config2 from '../../../config.js'
 import { spawn, execSync } from 'child_process';
 import { generateThumbnail } from './utils/create_thumbnail.js';
@@ -23,7 +24,7 @@ if(config2.platform === "windows") {
 export async function patcherExec(fileContents) {
     let allFilesExist = true;
     config.places.forEach(place => {
-        if (!fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}/buildings_index.json`) || !fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}/demand_data.json`) || !fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}/roads.geojson`) || !fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}/runways_taxiways.geojson`)) {
+        if (!fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'buildings_index.json')) || !fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'demand_data.json')) || !fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'roads.geojson')) || !fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'runways_taxiways.geojson'))) {
             console.error(`Processed data for ${place.name} (${place.code}) is missing! If you've downloaded a map, extract it into processed_data, otherwise please run download_data and process_data.`);
             allFilesExist = false;
         }
@@ -34,9 +35,9 @@ export async function patcherExec(fileContents) {
     console.log("Starting local tile server for thumbnail generation");
     let childProcess;
     if (config2.platform === 'windows')
-      childProcess = spawn('./pmtiles.exe', ["serve", "."], {cwd: `${import.meta.dirname}/map_tiles`});
+      childProcess = spawn('./pmtiles.exe', ["serve", "."], {cwd: path.join(import.meta.dirname, 'map_tiles')});
     else
-      childProcess = spawn('./pmtiles', ["serve", "."], {cwd: `${import.meta.dirname}/map_tiles`});
+      childProcess = spawn('./pmtiles', ["serve", "."], {cwd: path.join(import.meta.dirname, 'map_tiles')});
     
     console.log("Started pmtiles with PID: " + childProcess.pid);
     
@@ -162,7 +163,7 @@ export async function patcherExec(fileContents) {
 
     
     console.log("Modifying ocean depth layers");
-    const citiesWithOcean = config.places.filter(place => fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}/ocean_depth_index.json`)).map(p => p.code);
+    const citiesWithOcean = config.places.filter(place => fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'ocean_depth_index.json'))).map(p => p.code);
     const citiesWithOceanList = JSON.stringify(citiesWithOcean);
     const vanillaCitiesList = "['ATL', 'AUS', 'BAL', 'BOS', 'CHI', 'CIN', 'CLE', 'CLT', 'DAL', 'DC', 'DEN', 'DET', 'HNL', 'HOU', 'IND', 'MIA', 'MSP', 'NYC', 'PDX', 'PHL', 'PIT', 'SAN', 'SEA', 'SF', 'SLC', 'STL']";
 
@@ -239,7 +240,7 @@ export async function patcherExec(fileContents) {
 
     // Generate geojson for the ocean layer if data exists
     config.places.forEach(place => {
-        const oceanPath = `${import.meta.dirname}/processed_data/${place.code}/ocean_depth_index.json`;
+        const oceanPath = path.join(import.meta.dirname, 'processed_data', place.code, 'ocean_depth_index.json');
         if (fs.existsSync(oceanPath)) {
             const oceanData = JSON.parse(fs.readFileSync(oceanPath, 'utf-8'));
             const features = oceanData.depths.map(d => {
@@ -265,17 +266,18 @@ export async function patcherExec(fileContents) {
     config.places.forEach(place => {
       promises.push(new Promise((resolve) => {
         generateThumbnail(place.code).then((svgString) => {
-          fs.rmSync(`${citiesFolder}/data/${place.code}`, { recursive: true, force: true });
-          fs.mkdirSync(`${citiesFolder}/data/${place.code}`, { recursive: true});
-          fs.cpSync(`${import.meta.dirname}/processed_data/${place.code}/buildings_index.json`, `${citiesFolder}/data/${place.code}/buildings_index.json`);
-          fs.cpSync(`${import.meta.dirname}/processed_data/${place.code}/demand_data.json`, `${citiesFolder}/data/${place.code}/demand_data.json`);
-          fs.cpSync(`${import.meta.dirname}/processed_data/${place.code}/roads.geojson`, `${citiesFolder}/data/${place.code}/roads.geojson`);
-          fs.cpSync(`${import.meta.dirname}/processed_data/${place.code}/runways_taxiways.geojson`, `${citiesFolder}/data/${place.code}/runways_taxiways.geojson`);
-          if (fs.existsSync(`${import.meta.dirname}/processed_data/${place.code}/ocean_depth_index.json`)) {fs.cpSync(`${import.meta.dirname}/processed_data/${place.code}/ocean_depth_index.json`, `${citiesFolder}/data/${place.code}/ocean_depth_index.json`);}
-          fs.writeFileSync(`${fileContents.PATHS.RENDERERDIR}/city-maps/${place.code.toLowerCase()}.svg`, svgString);
-          const listOfPlaceFiles = fs.readdirSync(`${citiesFolder}/data/${place.code}`);
+          const destFolder = path.join(citiesFolder, 'data', place.code);
+          fs.rmSync(destFolder, { recursive: true, force: true });
+          fs.mkdirSync(destFolder, { recursive: true});
+          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'buildings_index.json'), path.join(destFolder, 'buildings_index.json'));
+          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'demand_data.json'), path.join(destFolder, 'demand_data.json'));
+          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'roads.geojson'), path.join(destFolder, 'roads.geojson'));
+          fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'runways_taxiways.geojson'), path.join(destFolder, 'runways_taxiways.geojson'));
+          if (fs.existsSync(path.join(import.meta.dirname, 'processed_data', place.code, 'ocean_depth_index.json'))) {fs.cpSync(path.join(import.meta.dirname, 'processed_data', place.code, 'ocean_depth_index.json'), path.join(destFolder, 'ocean_depth_index.json'));}
+          fs.writeFileSync(path.join(fileContents.PATHS.RENDERERDIR, 'city-maps', `${place.code.toLowerCase()}.svg`), svgString);
+          const listOfPlaceFiles = fs.readdirSync(destFolder);
           listOfPlaceFiles.forEach(fileName => {
-            execSync(`gzip -f "${citiesFolder}/data/${place.code}/${fileName}"`);
+            execSync(`gzip -f \"${path.join(destFolder, fileName)}\"`);
           });
           console.log(`Finished copying and compressing data for ${place.code} (${++counter} of ${config.places.length})`);
           resolve();
