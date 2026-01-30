@@ -93,6 +93,16 @@ class CityFeatures:
     conn_size_median: float
     conn_size_p90: float
     graph_density: float
+    
+    # Driving time metrics
+    driving_seconds_min: float
+    driving_seconds_p10: float
+    driving_seconds_p25: float
+    driving_seconds_median: float
+    driving_seconds_p75: float
+    driving_seconds_p90: float
+    driving_seconds_max: float
+    driving_seconds_std: float
 
 
 def get_appdata_path() -> Path:
@@ -209,6 +219,7 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
     # Stage 3: Connection Distribution Metrics
     conn_distances = np.array([p.get('drivingDistance', 0) for p in pops])
     conn_sizes = np.array([p.get('size', 0) for p in pops])
+    conn_seconds = np.array([p.get('drivingSeconds', 0) for p in pops])
     
     # Count unique edges (residence-job pairs)
     unique_edges = set((p['residenceId'], p['jobId']) for p in pops)
@@ -282,6 +293,16 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
         conn_size_median=float(np.median(conn_sizes)) if len(conn_sizes) > 0 else 0.0,
         conn_size_p90=float(np.percentile(conn_sizes, 90)) if len(conn_sizes) > 0 else 0.0,
         graph_density=len(unique_edges) / possible_edges if possible_edges > 0 else 0.0,
+        
+        # Driving time metrics
+        driving_seconds_min=float(conn_seconds.min()) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_p10=float(np.percentile(conn_seconds, 10)) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_p25=float(np.percentile(conn_seconds, 25)) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_median=float(np.median(conn_seconds)) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_p75=float(np.percentile(conn_seconds, 75)) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_p90=float(np.percentile(conn_seconds, 90)) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_max=float(conn_seconds.max()) if len(conn_seconds) > 0 else 0.0,
+        driving_seconds_std=float(conn_seconds.std()) if len(conn_seconds) > 0 else 0.0,
     )
 
 

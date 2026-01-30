@@ -84,6 +84,10 @@ PARAM_SPACE = {
     'population-scale-factor': (0.25, 2.0),
     'max-total-connections': (0, 5000),
     'max-connection-distance-meters': (0, 50000),  # 0 = unlimited
+    
+    # Road distance calculation
+    'circuity-factor': (1.1, 1.8),  # Typical urban road circuity
+    'average-driving-speed-mps': (8.0, 40.0),  # 21.6-43.2 km/h range
 }
 
 # Parameters to hold constant during optimization
@@ -91,6 +95,8 @@ FIXED_PARAMS = {
     'tile-zoom-level': 16,
     'connection-size-cap': 200,
     'skip-buildings-index': True,  # Skip for ML (faster) - will be created on final run
+    'use-grid-road-distances': False,  # Will be set to True if grids are precomputed
+    'grid-road-cell-size-meters': 500,
 }
 
 # Weights for aggregate error calculation (must sum to 1.0)
@@ -147,6 +153,14 @@ ERROR_WEIGHTS = {
     'connections_per_cluster': 0.05,
     'conn_size_mean': 0.04,
     'graph_density': 0.06,
+    
+    # Stage 3c: Driving time distribution
+    'driving_seconds_p10': 0.01,
+    'driving_seconds_p25': 0.01,
+    'driving_seconds_median': 0.02,
+    'driving_seconds_p75': 0.01,
+    'driving_seconds_p90': 0.01,
+    'driving_seconds_std': 0.01,
 }
 
 # City code mapping
@@ -501,6 +515,61 @@ def main():
     
     if preclassify_count > 0:
         print(f"  Created {preclassify_count} new preclassified caches")
+    
+    # Precompute road distance grids (one-time cost, huge speedup per trial)
+    print(f"\nPrecomputing road distance grids...")
+    grid_count = 0
+    use_grids = False
+    
+    try:
+        from grid_road_distances import GridRoadDistances, HAS_OSMNX, HAS_NETWORKX
+        
+        if HAS_OSMNX and HAS_NETWORKX:
+            for place_dict in target_places:
+                code = place_dict['code']
+                bbox = tuple(place_dict['bbox'])
+                raw_data_dir = MAP_PATCHER_DIR / 'raw_data' / code
+                grid_file = raw_data_dir / f"{code}_grid_distances.npz"
+                roads_geojson = raw_data_dir / "roads.geojson"
+                
+                if grid_file.exists():
+                    size_mb = grid_file.stat().st_size / 1_000_000
+                    print(f"  {code}: Using cached grid ({size_mb:.1f}MB)")
+                    use_grids = True
+                elif roads_geojson.exists():
+                    print(f"  {code}: Creating grid from roads.geojson...")
+                    try:
+                        import time
+                        start = time.time()
+                        grid = GridRoadDistances.from_geojson(
+                            roads_geojson, bbox,
+                            cell_size_meters=500,
+                            verbose=False
+                        )
+                        grid.save(grid_file)
+                        elapsed = time.time() - start
+                        grid_count += 1
+                        size_mb = grid_file.stat().st_size / 1_000_000
+                        print(f"  {code}: ✓ Created grid in {elapsed:.0f}s ({size_mb:.1f}MB)")
+                        use_grids = True
+                    except Exception as e:
+                        print(f"  {code}: ✗ Failed to create grid: {e}")
+                else:
+                    print(f"  {code}: No roads.geojson found, will use circuity factor")
+            
+            if grid_count > 0:
+                print(f"  Created {grid_count} new grids")
+            
+            if use_grids:
+                print(f"  ✓ Grid road distances will be used for optimization")
+                FIXED_PARAMS['use-grid-road-distances'] = True
+            else:
+                print(f"  Will use circuity factor for all cities")
+        else:
+            print(f"  OSMnx/NetworkX not available - using circuity factor")
+            print(f"  Install with: pip install osmnx networkx")
+    except ImportError:
+        print(f"  Grid road distances module not available - using circuity factor")
     
     # Create Optuna study
     print(f"\nStarting Bayesian Optimization:")

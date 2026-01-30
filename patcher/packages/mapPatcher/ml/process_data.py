@@ -43,6 +43,13 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+# Try to import grid road distances (optional but recommended for accuracy)
+try:
+    from grid_road_distances import GridRoadDistances
+    HAS_GRID_ROAD_DISTANCES = True
+except ImportError:
+    HAS_GRID_ROAD_DISTANCES = False
+
 # Base directory
 SCRIPT_DIR = Path(__file__).parent
 MAP_PATCHER_DIR = SCRIPT_DIR.parent
@@ -192,6 +199,12 @@ class ProcessingConfig:
     population_scale_factor: float = 1.0
     max_total_connections: int = 0  # 0 = unlimited, else probabilistically limit total
 
+    # Road distance calculation
+    use_grid_road_distances: bool = False  # Use precomputed grid road distances
+    grid_road_cell_size_meters: float = 500  # Grid cell size for road distance precomputation
+    circuity_factor: float = 1.4  # Fallback straight-line to road distance multiplier
+    average_driving_speed_mps: float = 8.33  # 30 km/h default driving speed
+
     # Other
     tile_zoom_level: int = 16
     disable_3d_buildings: bool = False
@@ -229,6 +242,10 @@ class ProcessingConfig:
             tile_zoom_level=d.get('tile-zoom-level', 16),
             disable_3d_buildings=d.get('disable-3d-buildings', False),
             skip_buildings_index=d.get('skip-buildings-index', False),
+            use_grid_road_distances=d.get('use-grid-road-distances', False),
+            grid_road_cell_size_meters=d.get('grid-road-cell-size-meters', 500),
+            circuity_factor=d.get('circuity-factor', 1.4),
+            average_driving_speed_mps=d.get('average-driving-speed-mps', 8.33),
         )
 
 
@@ -1373,9 +1390,17 @@ def split_large_neighborhoods(
 def generate_connections(
     metadata: Dict[str, Dict],
     centers: Dict[str, List[float]],
-    config: ProcessingConfig
+    config: ProcessingConfig,
+    road_distance_grid: Optional['GridRoadDistances'] = None
 ) -> List[Dict]:
-    """Generate connections using gravity model (vectorized inner loop)"""
+    """Generate connections using gravity model (vectorized inner loop)
+    
+    Args:
+        metadata: Dict of neighborhood metadata (population, jobs, etc.)
+        centers: Dict mapping neighborhood ID to [lon, lat] coordinates
+        config: ProcessingConfig with parameters
+        road_distance_grid: Optional GridRoadDistances for accurate road distances
+    """
     connections = []
     total_connections_generated = 0
 
@@ -1395,9 +1420,19 @@ def generate_connections(
     scaled_coords[:, 0] *= lon_scale
     scaled_coords[:, 1] *= lat_scale
 
-    # Precompute pairwise distance matrix
+    # Precompute pairwise straight-line distance matrix (for fallback/comparison)
     diff = scaled_coords[:, np.newaxis, :] - scaled_coords[np.newaxis, :, :]
-    dist_matrix = np.sqrt((diff ** 2).sum(axis=2))
+    straight_line_dist_matrix = np.sqrt((diff ** 2).sum(axis=2))
+
+    # Use road distance matrix if grid is available, otherwise apply circuity factor
+    if road_distance_grid is not None:
+        print(f"    Using precomputed grid road distances for gravity model...")
+        dist_matrix = road_distance_grid.get_road_distance_matrix(
+            coords, fallback_circuity=config.circuity_factor
+        )
+    else:
+        # Fallback: apply circuity factor to straight-line distances
+        dist_matrix = straight_line_dist_matrix * config.circuity_factor
 
     # Precompute arrays from metadata
     pop_array = np.array([metadata[pid]['total_population'] for pid in place_ids])
@@ -1490,7 +1525,8 @@ def generate_connections(
         # Vectorized connection size calculation
         connection_sizes = np.round((sel_gravities / sel_gravity_total) * total_demand).astype(int)
         distances = sel_distances.astype(float)
-        seconds_arr = distances * 0.12
+        # Calculate driving time using configured speed (distance / speed)
+        seconds_arr = distances / config.average_driving_speed_mps
         inner_ids = [place_ids[int(idx)] for idx in sel_place_indices]
         
         # Vectorized connection generation with chunking
@@ -1537,9 +1573,20 @@ def process_place_connections(
     config: ProcessingConfig,
     preclassified_path: Path,
     buildings_msgpack_path: Optional[Path] = None,
-    raw_buildings: Optional[List[Dict]] = None
+    raw_buildings: Optional[List[Dict]] = None,
+    raw_data_dir: Optional[Path] = None
 ) -> Dict:
-    """Main processing function for demand data"""
+    """Main processing function for demand data
+    
+    Args:
+        place: Place object with code, name, bbox
+        raw_places: List of raw place data from OSM
+        config: ProcessingConfig with all parameters
+        preclassified_path: Path to preclassified buildings msgpack
+        buildings_msgpack_path: Path to buildings msgpack (optional)
+        raw_buildings: Raw building data (optional)
+        raw_data_dir: Directory containing raw data files (for roads.geojson)
+    """
     print(f"  Extracting neighborhoods...")
     neighborhoods, centers = extract_neighborhoods(raw_places)
     print(f"  Found {len(neighborhoods)} OSM neighborhoods")
@@ -1667,9 +1714,46 @@ def process_place_connections(
             metadata[pid]['pct_population'] = float(pct_pops[i])
             metadata[pid]['pct_jobs'] = float(pct_jobs[i])
 
+    # Load or create road distance grid if enabled
+    road_distance_grid = None
+    if config.use_grid_road_distances and HAS_GRID_ROAD_DISTANCES:
+        bbox = tuple(place.bbox)
+        grid_file = None
+        
+        # Try to find existing grid file
+        if raw_data_dir is not None:
+            grid_file = raw_data_dir / f"{place.code}_grid_distances.npz"
+        
+        if grid_file and grid_file.exists():
+            print(f"  Loading precomputed grid road distances from {grid_file.name}...")
+            road_distance_grid = GridRoadDistances.load(grid_file)
+        else:
+            # Try to create from roads.geojson
+            roads_geojson = raw_data_dir / "roads.geojson" if raw_data_dir else None
+            if roads_geojson and roads_geojson.exists():
+                print(f"  Creating grid road distances from roads.geojson (cell size: {config.grid_road_cell_size_meters}m)...")
+                try:
+                    road_distance_grid = GridRoadDistances.from_geojson(
+                        roads_geojson, bbox,
+                        cell_size_meters=config.grid_road_cell_size_meters,
+                        verbose=True
+                    )
+                    # Save for future use
+                    if grid_file:
+                        road_distance_grid.save(grid_file)
+                except Exception as e:
+                    print(f"  WARNING: Failed to create grid road distances: {e}")
+                    print(f"  Falling back to circuity factor ({config.circuity_factor})")
+            else:
+                print(f"  WARNING: roads.geojson not found, using circuity factor ({config.circuity_factor})")
+    elif config.use_grid_road_distances and not HAS_GRID_ROAD_DISTANCES:
+        print(f"  WARNING: Grid road distances requested but module not available.")
+        print(f"  Install with: pip install osmnx networkx")
+        print(f"  Falling back to circuity factor ({config.circuity_factor})")
+
     # Generate connections
     print(f"  Generating connections...")
-    connections = generate_connections(metadata, centers, config)
+    connections = generate_connections(metadata, centers, config, road_distance_grid)
     print(f"  Generated {len(connections)} connections")
 
     # Build final output
@@ -1813,7 +1897,8 @@ def process_place(place: Place, config: ProcessingConfig) -> Dict:
         place, raw_places, config,
         preclassified_path=preclassified_path,
         buildings_msgpack_path=buildings_msgpack,
-        raw_buildings=raw_buildings
+        raw_buildings=raw_buildings,
+        raw_data_dir=raw_data_dir
     )
 
     # Create output directory
@@ -1838,11 +1923,17 @@ def process_place(place: Place, config: ProcessingConfig) -> Dict:
     # Skip during ML optimization for speed - only needed for final game patch
     if not config.skip_buildings_index:
         print(f"  Creating buildings_index.json...")
-        buildings_index = create_buildings_index(raw_buildings, place.bbox)
-        buildings_index_file = output_dir / 'buildings_index.json'
-        with open(buildings_index_file, 'w', encoding='utf-8') as f:
-            json.dump(buildings_index, f)
-        print(f"  Wrote buildings_index.json ({buildings_index['stats']['count']} buildings)")
+        # Need raw buildings for geometry - load if not already loaded
+        if raw_buildings is None:
+            raw_buildings = load_data_file(buildings_json)
+        if raw_buildings:
+            buildings_index = create_buildings_index(raw_buildings, place.bbox)
+            buildings_index_file = output_dir / 'buildings_index.json'
+            with open(buildings_index_file, 'w', encoding='utf-8') as f:
+                json.dump(buildings_index, f)
+            print(f"  Wrote buildings_index.json ({buildings_index['stats']['count']} buildings)")
+        else:
+            print(f"  Warning: No raw buildings available for buildings_index.json")
 
     return demand_data
 

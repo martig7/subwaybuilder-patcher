@@ -709,8 +709,14 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       const connectionSize = Math.round((item.gravity / selectedTotalGravity) * totalDemand);
       if (connectionSize <= 0) return;
       
-      const connectionDistance = item.distance;
-      const connectionSeconds = connectionDistance * 0.12; // very scientific (hey, this is something i got from the subwaybuilder data)
+      // Apply circuity factor: roads are typically 1.3-1.5x longer than straight-line
+      const CIRCUITY_FACTOR = config['circuity-factor'] || 1.4;
+      const straightLineDistance = item.distance;
+      const roadDistance = straightLineDistance * CIRCUITY_FACTOR;
+      
+      // Calculate driving time based on average urban speed (30 km/h = 8.33 m/s)
+      const AVERAGE_SPEED_MPS = config['average-driving-speed-mps'] || 8.33;
+      const connectionSeconds = roadDistance / AVERAGE_SPEED_MPS;
       
       // Split large connections into chunks
       let remainingSize = connectionSize;
@@ -721,7 +727,7 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
           residenceId: outerPlace.placeID,
           jobId: item.innerPlace.placeID,
           size: chunkSize,
-          drivingDistance: Math.round(connectionDistance),
+          drivingDistance: Math.round(roadDistance),
           drivingSeconds: Math.round(connectionSeconds),
         });
         remainingSize -= chunkSize;
