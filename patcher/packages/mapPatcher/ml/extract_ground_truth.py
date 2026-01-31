@@ -200,9 +200,11 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
             max(lons_all) + pad_lon, max(lats_all) + pad_lat]
 
     # Stage 2: Cluster Distribution Metrics
-    sizes = np.array([p.get('jobs', 0) + p.get('residents', 0) for p in points])
-    res_sizes = np.array([p.get('residents', 0) for p in points])
-    job_sizes = np.array([p.get('jobs', 0) for p in points])
+    # Filter out zero-size nodes — they don't exist in generated data and skew stats
+    nonzero_points = [p for p in points if p.get('jobs', 0) + p.get('residents', 0) > 0]
+    sizes = np.array([p.get('jobs', 0) + p.get('residents', 0) for p in nonzero_points])
+    res_sizes = np.array([p.get('residents', 0) for p in points if p.get('residents', 0) > 0])
+    job_sizes = np.array([p.get('jobs', 0) for p in points if p.get('jobs', 0) > 0])
     total_jobs = sum(p.get('jobs', 0) for p in points)
     total_residents = sum(p.get('residents', 0) for p in points)
     total_size = total_jobs + total_residents
@@ -234,7 +236,7 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
         bbox=bbox,
 
         # Stage 2: Cluster Distribution
-        cluster_count=len(points),
+        cluster_count=len(nonzero_points),
         size_mean=float(sizes.mean()) if len(sizes) > 0 else 0.0,
         size_median=float(np.median(sizes)) if len(sizes) > 0 else 0.0,
         size_std=float(sizes.std()) if len(sizes) > 0 else 0.0,
@@ -276,11 +278,11 @@ def extract_features(data: Dict, city_code: str) -> CityFeatures:
         job_nn_dist_max=float(job_nn_distances.max()) if len(job_nn_distances) > 0 else 0.0,
         job_nn_dist_std=float(job_nn_distances.std()) if len(job_nn_distances) > 0 else 0.0,
         area_km2=area_km2,
-        density=len(points) / area_km2 if area_km2 > 0 else 0.0,
-        
+        density=len(nonzero_points) / area_km2 if area_km2 > 0 else 0.0,
+
         # Stage 3: Connection Distribution
         connection_count=len(pops),
-        connections_per_cluster=len(pops) / len(points) if len(points) > 0 else 0.0,
+        connections_per_cluster=len(pops) / len(nonzero_points) if len(nonzero_points) > 0 else 0.0,
         conn_dist_min=float(conn_distances.min()) if len(conn_distances) > 0 else 0.0,
         conn_dist_p10=float(np.percentile(conn_distances, 10)) if len(conn_distances) > 0 else 0.0,
         conn_dist_p25=float(np.percentile(conn_distances, 25)) if len(conn_distances) > 0 else 0.0,

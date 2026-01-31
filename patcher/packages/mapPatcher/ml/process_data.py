@@ -15,6 +15,7 @@ import os
 import random
 import gc
 from pathlib import Path
+
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor
@@ -1723,7 +1724,6 @@ def process_place_connections(
         # Try to find existing grid file
         if raw_data_dir is not None:
             grid_file = raw_data_dir / f"{place.code}_grid_distances.npz"
-        
         if grid_file and grid_file.exists():
             print(f"  Loading precomputed grid road distances from {grid_file.name}...")
             road_distance_grid = GridRoadDistances.load(grid_file)
@@ -1732,6 +1732,7 @@ def process_place_connections(
             roads_geojson = raw_data_dir / "roads.geojson" if raw_data_dir else None
             if roads_geojson and roads_geojson.exists():
                 print(f"  Creating grid road distances from roads.geojson (cell size: {config.grid_road_cell_size_meters}m)...")
+                
                 try:
                     road_distance_grid = GridRoadDistances.from_geojson(
                         roads_geojson, bbox,
@@ -1741,6 +1742,7 @@ def process_place_connections(
                     # Save for future use
                     if grid_file:
                         road_distance_grid.save(grid_file)
+                    
                 except Exception as e:
                     print(f"  WARNING: Failed to create grid road distances: {e}")
                     print(f"  Falling back to circuity factor ({config.circuity_factor})")
@@ -1755,6 +1757,7 @@ def process_place_connections(
     print(f"  Generating connections...")
     connections = generate_connections(metadata, centers, config, road_distance_grid)
     print(f"  Generated {len(connections)} connections")
+    
 
     # Build final output
     terminal_ticker = 0

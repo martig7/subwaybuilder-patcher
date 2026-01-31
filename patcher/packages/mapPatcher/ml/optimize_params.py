@@ -123,20 +123,20 @@ ERROR_WEIGHTS = {
     'job_size_max': 0.03,  # Prevents mega-clusters
 
     # Stage 2c: Residential spacing distribution
-    'res_nn_dist_std': 0.02,
-    'res_nn_dist_p10': 0.06,
+    'res_nn_dist_std': 0.03,
+    'res_nn_dist_p10': 0.04,
     'res_nn_dist_p25': 0.01,
     'res_nn_dist_p75': 0.01,
     'res_nn_dist_p90': 0.02,
-    'res_nn_dist_max': 0.01,
-
+    'res_nn_dist_max': 0.02,
+    
     # Stage 2d: Commercial spacing distribution
-    'job_nn_dist_std': 0.02,
-    'job_nn_dist_p10': 0.06,
+    'job_nn_dist_std': 0.03,
+    'job_nn_dist_p10': 0.04,
     'job_nn_dist_p25': 0.01,
     'job_nn_dist_p75': 0.01,
     'job_nn_dist_p90': 0.02,
-    'job_nn_dist_max': 0.01,
+    'job_nn_dist_max': 0.02,
 
     # Stage 2e: Overall cluster structure
     'cluster_count': 0.05,
@@ -326,7 +326,7 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
     # Process cities one at a time with per-city pruning
     total_error = 0.0
     match_count = 0
-    t0 = time.perf_counter()
+
 
     for step, place_dict in enumerate(context.target_places):
         code = place_dict['code']
@@ -381,7 +381,7 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
             context.cleanup()
             return float('inf')
 
-    elapsed = time.perf_counter() - t0
+
 
     if match_count == 0:
         print(f"W{worker_id}: No matching cities found", file=sys.stderr)
@@ -390,14 +390,8 @@ def objective(trial: optuna.Trial, context: OptimizationContext) -> float:
     
     avg_error = total_error / match_count
 
-    # Time-based reward: penalize slow configs
-    TIME_WEIGHT = 0.02   # 2% of objective from processing time
-    TIME_BASELINE = 240.0 # seconds — expected normal duration
-    time_penalty = max(0.0, (elapsed - TIME_BASELINE) / TIME_BASELINE) * TIME_WEIGHT
-    score = avg_error + time_penalty
-
     context.cleanup()
-    return score
+    return avg_error
 
 
 def load_ground_truth_shared(gt_path: Path) -> dict:
