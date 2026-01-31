@@ -55,6 +55,40 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent
 MAP_PATCHER_DIR = SCRIPT_DIR.parent
 
+# === Speed curve model (loaded from fit_speed_curve.py output) ===
+_SPEED_CURVE = None
+_speed_curve_path = SCRIPT_DIR / 'speed_curve.json'
+if _speed_curve_path.exists():
+    try:
+        with open(_speed_curve_path, 'r') as _f:
+            _SPEED_CURVE = json.load(_f)
+        print(f"Loaded speed curve model from speed_curve.json "
+              f"(floor={_SPEED_CURVE['floor_speed_mps']:.2f} m/s, "
+              f"breakpoint={_SPEED_CURVE['breakpoint_m']:.0f}m)")
+    except Exception as _e:
+        print(f"Warning: Failed to load speed_curve.json: {_e}")
+
+
+def compute_driving_speed(distances: np.ndarray, fallback_speed_mps: float) -> np.ndarray:
+    """Compute effective driving speed from road distances.
+
+    Uses piecewise model from speed_curve.json if available,
+    otherwise falls back to flat speed.
+    """
+    if _SPEED_CURVE is None:
+        return np.full_like(distances, fallback_speed_mps, dtype=float)
+
+    floor_speed = _SPEED_CURVE['floor_speed_mps']
+    breakpoint = _SPEED_CURVE['breakpoint_m']
+    a = _SPEED_CURVE['a']
+    b = _SPEED_CURVE['b']
+
+    result = np.full_like(distances, floor_speed, dtype=float)
+    above = distances > breakpoint
+    result[above] = a * np.power(distances[above], b)
+    return result
+
+
 # === In-memory cache for preclassified buildings ===
 # Persists across optimization trials to avoid repeated disk I/O
 _PRECLASSIFIED_CACHE: Dict[str, Dict[str, Dict]] = {}
@@ -1526,8 +1560,9 @@ def generate_connections(
         # Vectorized connection size calculation
         connection_sizes = np.round((sel_gravities / sel_gravity_total) * total_demand).astype(int)
         distances = sel_distances.astype(float)
-        # Calculate driving time using configured speed (distance / speed)
-        seconds_arr = distances / config.average_driving_speed_mps
+        # Calculate driving time using speed curve (or flat fallback)
+        speed_arr = compute_driving_speed(distances, config.average_driving_speed_mps)
+        seconds_arr = distances / speed_arr
         inner_ids = [place_ids[int(idx)] for idx in sel_place_indices]
         
         # Vectorized connection generation with chunking

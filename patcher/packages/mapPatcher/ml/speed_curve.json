@@ -1,0 +1,11 @@
+{
+  "model": "piecewise",
+  "description": "if distance <= breakpoint: speed = floor_speed; else: speed = a * distance^b",
+  "floor_speed_mps": 8.330573170091682,
+  "breakpoint_m": 2314.164473644745,
+  "a": 1.2139704746411963,
+  "b": 0.24862328962822722,
+  "rmse": 3.184705308383725,
+  "r2": 0.3081913590717055,
+  "total_samples": 199999
+}

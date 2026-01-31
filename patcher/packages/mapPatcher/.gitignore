@@ -10,4 +10,3 @@ config.js
 worker_configs/
 ml_temp/
 ml/__pycache__/
-config.json

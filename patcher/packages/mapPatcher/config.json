@@ -1,0 +1,69 @@
+{
+  "tile-zoom-level": 16,
+  "connection-size-cap": 200,
+  "skip-buildings-index": true,
+  "use-grid-road-distances": true,
+  "grid-road-cell-size-meters": 500,
+  "residential-sqft-multiplier": 1.6436138399013343,
+  "commercial-sqft-multiplier": 1.6418878825317185,
+  "mixed-use-residential-ratio": 0.6201801736542214,
+  "yes-building-sqft-per-resident": 773,
+  "yes-building-sqft-per-job": 445,
+  "levels-default": 1.393389765634162,
+  "levels-multiplier": 0.586825414721939,
+  "min-building-area-sqft": 818,
+  "max-building-area-sqft": 65964,
+  "residential-occupancy-rate": 0.7491993339013555,
+  "max-place-size-for-splitting": 2381,
+  "merge-places-distance-meters": 93,
+  "splitting-num-clusters-divisor": 686,
+  "splitting-cluster-min-separation": 0.0037044080579422926,
+  "gravity-distance-floor-meters": 4781,
+  "gravity-exponent": 0.8593403529979393,
+  "min-connections-per-cluster": 1,
+  "max-connections-per-cluster": 14,
+  "connection-scaling-divisor": 95,
+  "population-scale-factor": 1.482734075890274,
+  "max-total-connections": 3549,
+  "max-connection-distance-meters": 21270,
+  "circuity-factor": 1.1913269866551184,
+  "average-driving-speed-mps": 15.746169083077419,
+  "places": [
+    {
+      "code": "PHL_GEN",
+      "name": "Philadelphia (Generated)",
+      "description": "Generated data for Philadelphia, USA",
+      "bbox": [
+        -75.47866528,
+        39.68028048,
+        -74.78720672,
+        40.24320752
+      ],
+      "population": 10000000
+    },
+    {
+      "code": "CHI_GEN",
+      "name": "Chicago (Generated)",
+      "description": "Generated data for Chicago, USA",
+      "bbox": [
+        -88.27648464,
+        41.4513737,
+        -87.51085536,
+        42.1664933
+      ],
+      "population": 10000000
+    },
+    {
+      "code": "SF_GEN",
+      "name": "San Francisco (Generated)",
+      "description": "Generated data for San Francisco, USA",
+      "bbox": [
+        -122.62258281999999,
+        37.1667049,
+        -121.66132018,
+        38.1602221
+      ],
+      "population": 10000000
+    }
+  ]
+}
